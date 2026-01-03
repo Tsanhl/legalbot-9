@@ -1,0 +1,28 @@
+# Core AI Dependencies
+crewai==0.28.8
+crewai_tools==0.1.6
+langchain_community==0.0.29
+langchain-groq
+langchain-openai
+
+# Embeddings
+sentence-transformers
+
+# Web Search
+tavily-python
+
+# Document Processing
+pypdf
+chromadb
+
+# Jupyter
+jupyter
+ipykernel
+
+# Utilities
+python-dotenv
+tqdm
+
+# Streamlit App
+streamlit>=1.30.0
+google-generativeai>=0.4.0
