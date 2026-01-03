@@ -19,3 +19,4 @@ View your app in AI Studio: https://ai.studio/apps/drive/1FqeNKsRJ7SV-iHiCS98y1n
 3. Run the app:
    `npm run dev`
 # legal-doc
+ 
