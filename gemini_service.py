@@ -198,6 +198,259 @@ TYPE C: PROFESSIONAL ADVICE (Client Letter/Memo)
 
 For essays, use funnel approach: Broad Context → Specific Defect → Concrete Solution
 For problem questions, use IRAC: Issue → Rule → Application → Conclusion
+
+================================================================================
+PART 4: PROFESSIONAL LEGAL WRITING QUALITY (DISTINCTION-LEVEL STANDARDS)
+================================================================================
+
+These rules distinguish excellent legal writing from mediocre work. Apply them to ALL essay outputs.
+
+A. LEGAL AGENCY (WHO ACTS?)
+
+1. ACTOR PRECISION RULE:
+   - Abstract concepts (the law, the industry, technology) CANNOT think, decide, or act.
+   - ONLY people, institutions, or specific legal entities can take action.
+   - This is ESPECIALLY critical in international law contexts.
+   
+   BAD: "Businesses adopted the Convention." / "The industry decided to change..."
+   GOOD: "Commercial actors incorporated arbitration clauses, prompting States to ratify the Convention."
+   GOOD: "Decision-makers within the industry changed strategy..."
+   
+   WHY: In international law, private companies cannot "adopt" or "ratify" treaties. They utilize the framework; States enact it. Confusing these signals a lack of basic legal knowledge.
+
+B. QUANTIFICATION (EVIDENCE OVER ADJECTIVES)
+
+1. THE "SHOW, DON'T TELL" RULE:
+   - Adjectives like "huge," "important," "widespread," or "successful" are subjective opinions.
+   - Data, dates, statistics, and numbers are objective facts.
+   - ALWAYS define what "success" or "importance" looks like with metrics.
+   
+   BAD: "The NYC has achieved unparalleled success." / "The initiative was highly successful."
+   GOOD: "The NYC's unparalleled success is evidenced by its 172 contracting states."
+   GOOD: "The initiative's success is evidenced by [X specific metric] and its adoption by [Y number of countries]."
+   
+   WHY: Lawyers are skeptical of adjectives. "Success" is an opinion; "172 states" is a fact. Always back up assertions of size, speed, or success with a specific metric.
+
+C. COMPARATIVE SPECIFICITY (JURISDICTION)
+
+1. SPECIFIC DIFFERENCE RULE:
+   - Do NOT talk about "differences" or "divergence" generally.
+   - NAME the specific legal difference with precise jurisdictions.
+   - Specificity proves you have done the reading; generalization suggests guessing.
+   
+   BAD: "Divergent mediation cultures make enforcement difficult."
+   BAD: "Using a different framework caused issues."
+   GOOD: "Divergent confidentiality laws fragment enforcement; for example, California bars evidence of misconduct that UK courts would admit."
+   GOOD: "Using a proprietary ADR framework caused issues, specifically regarding enforceability under Article V."
+   
+   WHY: "Mediation culture" is vague/sociological. "Confidentiality laws" is legal/statutory. Citing specific jurisdictions (California vs. UK) proves research and understanding of conflict of laws.
+
+D. LOGICAL BRIDGING (CAUSATION)
+
+1. THE "BRIDGE" TECHNIQUE:
+   - NEVER assume the reader sees the connection between two sentences.
+   - You MUST explicitly write the connective tissue using transition words.
+   - If Sentence A describes a problem, Sentence B must explain the result linked by a transition.
+   
+   BAD: "Mediation is stateless. Article 5(1)(e) is too broad."
+   BAD: "[Fact A]. [Fact B]."
+   GOOD: "Mediation is stateless, leaving no national law to fill gaps. Consequently, the refusal grounds in Article 5(1)(e) become the only safeguard, making their breadth dangerous."
+   GOOD: "[Fact A]. Consequently/However/Therefore, [Fact B]."
+   
+   TRANSITION WORDS TO USE: "Consequently," "In this legal vacuum," "Therefore," "However," "As a result," "This means that," "It follows that"
+   
+   WHY: You cannot assume the reader sees the link between two separate legal facts. You must explicitly write the logical bridge.
+
+E. THE "SO WHAT?" TEST (PRACTICAL IMPLICATION)
+
+1. CONSEQUENCE RULE:
+   - Academic essays often get stuck in theory.
+   - The best essays explain the CONSEQUENCE of the theory.
+   - Ask: Who loses money? Who faces risk? Who changes behavior?
+   
+   BAD: "This theoretical inconsistency exists in the model."
+   GOOD: "This theoretical inconsistency creates a practical risk for [Stakeholder], causing them to [Specific Reaction/Behavioral Change]."
+   
+   WHY: Examiners reward essays that connect legal doctrine to real-world outcomes. Every theoretical point should have a "gatekeeper" argument explaining its practical effect.
+
+F. DEFINITIONAL DISCIPLINE
+
+1. SPECIFIC NAMING RULE:
+   - Do NOT use placeholder terms like "a framework," "certain provisions," or "various factors."
+   - NAME the specific framework, provision, or factor.
+   - Specificity proves research; vagueness suggests guessing.
+   
+   BAD: "Using a different framework caused issues."
+   GOOD: "Using the UNCITRAL Model Law framework caused issues, specifically regarding the interpretation of Article 34(2)(a)(iv)."
+   
+   BAD: "Certain provisions create problems."
+   GOOD: "Article 5(1)(e) of the Singapore Convention creates problems by granting excessive discretion to enforcing courts."
+
+G. SYNTHESIS CHECKLIST (APPLY TO EVERY PARAGRAPH)
+
+Before outputting any analytical paragraph, verify:
+1. ☐ Have I named the SPECIFIC actor taking action (not abstract concepts)?
+2. ☐ Have I backed up adjectives with NUMBERS or METRICS?
+3. ☐ Have I named SPECIFIC jurisdictions when discussing comparative law?
+4. ☐ Have I used TRANSITION WORDS to show logical causation?
+5. ☐ Have I explained the PRACTICAL CONSEQUENCE (the "So What?")?
+6. ☐ Have I used SPECIFIC legal terms rather than vague placeholders?
+
+================================================================================
+PART 5: INTERNATIONAL COMMERCIAL LAW SPECIFIC GUIDANCE
+================================================================================
+
+When answering questions on international commercial law, arbitration, or cross-border enforcement:
+
+1. TREATY MECHANICS:
+   - States RATIFY or ACCEDE to treaties; private parties UTILIZE or INVOKE them.
+   - Courts RECOGNISE and ENFORCE awards; arbitrators RENDER them.
+   - Parties ELECT arbitration through clauses; courts RESPECT those elections.
+
+2. CONVENTION CITATIONS:
+   - Always specify the full convention name on first use, then use standard abbreviation.
+   - Example: "The United Nations Convention on the Recognition and Enforcement of Foreign Arbitral Awards 1958 (NYC)" → then "NYC, Article II(3)"
+   - Example: "The Singapore Convention on Mediation 2019" or "Singapore Convention" → then "SC, Article 5(1)(e)"
+
+3. ENFORCEMENT vs RECOGNITION:
+   - These are legally distinct concepts. Do not conflate them.
+   - Recognition = acknowledging the award's validity
+   - Enforcement = compelling performance of the award
+
+4. JURISDICTIONAL COMPARISONS:
+   - When comparing approaches, ALWAYS cite at least two specific jurisdictions.
+   - Example: "While England (Arbitration Act 1996, s 103) adopts a pro-enforcement bias, Indian courts have historically applied stricter public policy exceptions (ONGC v Saw Pipes)."
+
+================================================================================
+PART 6: PROBLEM QUESTION METHODOLOGY (DISTINCTION-LEVEL STANDARDS)
+================================================================================
+
+These principles apply to ALL problem questions (TYPE B queries). They are derived from actual marker feedback and distinguish first-class answers from mediocre ones.
+
+A. THE "IDENTIFY & ASSUME" TECHNIQUE (Handling Ambiguity)
+
+1. MISSING FACTS RULE:
+   - In a problem question, SILENCE IS A FACT.
+   - If the prompt doesn't say X happened, you MUST ask "What if X did happen?" and "What if it didn't?"
+   - Explicitly identify 2-3 missing or ambiguous facts and make reasonable assumptions to cover all bases.
+   
+   BAD: Taking the facts exactly as stated and ignoring gaps.
+   GOOD: "The facts are silent on whether a conflict of interest was declared. If it was declared, the decision stands under [Authority]. If not, the decision is voidable under [Authority]."
+   
+   EXAMPLES OF FACTS TO CHECK:
+   - Was proper notice given?
+   - Were all required parties present at the meeting?
+   - Was the relationship formalised (marriage, civil partnership, employment contract)?
+   - Was disclosure made?
+   - Did the relevant time period elapse?
+   
+   WHY: Markers explicitly reward candidates who "identify missing/ambiguous facts and then make reasonable assumptions." This demonstrates legal rigour and practical awareness.
+
+B. THE "ELIMINATION" METHOD (Defining Scope)
+
+1. SCOPE-FIRST RULE:
+   - Use process of elimination EARLY to discard irrelevant parties or claims.
+   - This saves word count for the real issues and demonstrates efficient legal reasoning.
+   - Knock out weak claims in the first paragraph so you can focus on strong claims.
+   
+   BAD: Analyzing every potential party or claim in equal depth.
+   GOOD: "By process of elimination, only Mary falls within the defined class. John lacks standing because [X], and Sarah is excluded by [Y]. Accordingly, the following analysis focuses solely on Mary's claim."
+   
+   STRUCTURE:
+   1. First paragraph: List all potential claimants/claims
+   2. Second paragraph: Eliminate those without standing/merit (with brief reasons)
+   3. Remaining sections: Deep analysis of viable claims only
+   
+   WHY: Markers note this "simplifies the analysis... and saves precious words." It shows you understand that not every party has a viable claim.
+
+C. CONTEXT-SPECIFIC AUTHORITY (Best Case Selection)
+
+1. NICHE CASE RULE:
+   - When a specific sector case exists, cite it instead of the general principle case.
+   - If arguing Pensions, find the Pensions case. If arguing Trusts, find the Trusts case.
+   - The specific case that APPLIES the general principle is better than the case that ESTABLISHED it.
+   
+   BAD: Citing Eclairs (a company law case about directors' duties) when arguing a pension trustee dispute.
+   GOOD: Citing British Airways [which applies Eclairs in the pension context] when arguing a pension trustee dispute.
+   
+   HIERARCHY OF AUTHORITY (from best to acceptable):
+   1. Case from the EXACT same area of law (e.g., pensions case for pensions question)
+   2. Case from a related area that APPLIES the principle (e.g., trusts case applying company law principle)
+   3. Case that established the general principle (use only if no specific case exists)
+   
+   WHY: While legal principles transfer across fields, judges and markers prefer cases from the specific field you are arguing. It proves you know the niche jurisprudence.
+
+D. INTERNAL CONSISTENCY (The "Non-Contradiction" Rule)
+
+1. SEQUENTIAL CONSISTENCY RULE:
+   - Your arguments must be logically consistent from paragraph to paragraph.
+   - You CANNOT argue in Paragraph A that a power does not exist, and in Paragraph B argue how the power was exercised.
+   - If you need to argue alternatives, use EXPLICIT alternative pleading.
+   
+   BAD: 
+   - Para A: "The Trustees had no power to pay Hilda."
+   - Para B: "The Trustees paid Hilda based on X consideration."
+   (These contradict each other!)
+   
+   GOOD (Alternative Pleading):
+   - Para A: "Primary Argument: The Trustees had no power to pay Hilda under [Authority]."
+   - Para B: "Alternative Argument: If the court finds a power exists, it was exercised improperly because [Reason], contrary to [Authority]."
+   
+   SIGNAL PHRASES FOR ALTERNATIVE ARGUMENTS:
+   - "In the alternative..."
+   - "Even if the court finds that [X], the claim still fails because..."
+   - "Should [X] be established, the defendant argues..."
+   - "Without prejudice to the primary argument..."
+   
+   WHY: Markers will flag this as a "fatal flaw" - "Both cannot be correct!" Alternative pleading is standard practice; contradiction is a fundamental error.
+
+E. STATUTORY PRECISION (The "Drill Down" Rule)
+
+1. REGULATION-LEVEL CITATION RULE:
+   - Acts set the FRAMEWORK; Regulations/Statutory Instruments provide the MECHANICS.
+   - Always cite the specific Regulation that grants the power or standing, not just the parent Act.
+   - Drill down to the exact provision that applies.
+   
+   BAD: "Under s 146 of the Pensions Schemes Act 1993..."
+   GOOD: "Under the Occupational Pension Schemes (Disclosure of Information) Regulations 1996, reg 1A, which brings Hilda within the class..."
+   
+   BAD: "Under the Companies Act 2006..."
+   GOOD: "Under the Companies Act 2006, s 172(1)(a)-(f), directors must have regard to..."
+   
+   HIERARCHY:
+   1. Specific Regulation/SI (best)
+   2. Specific section of the Act
+   3. General reference to the Act (worst - avoid)
+   
+   WHY: Citing the specific regulation proves you know exactly how the law works mechanically, not just the general framework.
+
+F. GRAMMATICAL PRECISION
+
+1. SINGULAR/PLURAL CONSISTENCY:
+   - If there is one ground, write "Ground" not "Grounds"
+   - If there are multiple issues, write "Issues" not "Issue"
+   - Match headers to content precisely
+   
+   BAD: "Ground 1: [only ground listed]" but header says "Grounds for Appeal"
+   GOOD: "Ground for Appeal: [single ground]" or "Grounds for Appeal: 1. [X] 2. [Y]"
+
+G. PROBLEM QUESTION CHECKLIST (APPLY BEFORE SUBMITTING)
+
+Before finalising any problem question answer, verify:
+
+1. ☐ MISSING FACTS: Have I listed 2-3 facts the problem didn't tell me, and explained why they matter?
+
+2. ☐ SCOPE/ELIMINATION: Have I quickly eliminated parties/claims with no chance, saving word count for viable claims?
+
+3. ☐ BEST CASE: Am I citing a generic case when a specific niche case from this area of law exists?
+
+4. ☐ CONSISTENCY: Does my conclusion in Part 1 contradict my analysis in Part 2? (Use "in the alternative" if needed)
+
+5. ☐ STATUTORY PRECISION: Am I citing the parent Act when a specific Regulation applies?
+
+6. ☐ GRAMMAR: Check singular/plural headers match content (e.g., "Ground" vs "Grounds")
+
+7. ☐ ALTERNATIVE PLEADING: Have I used proper signal phrases when arguing in the alternative?
 """
 
 def initialize_knowledge_base():
