@@ -83,10 +83,14 @@ section[data-testid="stSidebar"] div {
 [data-testid="stAppViewContainer"],
 [data-testid="stMain"],
 .main,
-.block-container {
+.block-container,
+div[data-testid="stAppViewContainer"] > section,
+div[data-testid="stAppViewContainer"] > section > div {
     opacity: 1 !important;
     filter: none !important;
     backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    transition: none !important;
 }
 
 /* Remove any modal overlay effects */
