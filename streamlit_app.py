@@ -404,6 +404,15 @@ def init_session_state():
     
     if 'rag_stats' not in st.session_state:
         st.session_state.rag_stats = None
+    
+    if 'rag_indexed' not in st.session_state:
+        st.session_state.rag_indexed = False
+    
+    if 'rag_chunk_count' not in st.session_state:
+        st.session_state.rag_chunk_count = 0
+    
+    if 'auto_index_triggered' not in st.session_state:
+        st.session_state.auto_index_triggered = False
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -627,17 +636,6 @@ def main():
                         })
                 st.rerun()
         
-        # Knowledge Base Status
-        if st.session_state.knowledge_base_loaded:
-            st.markdown("""
-            <div class="kb-status">
-                <span class="kb-status-dot"></span>
-                <span style="color: #86efac; font-weight: 500; margin-left: 0.5rem;">📚 Knowledge Base Active</span>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.info("⏳ Loading Knowledge Base...")
-        
         # Document list
         current_project = get_current_project()
         if current_project and current_project['documents']:
@@ -653,36 +651,31 @@ def main():
                     if st.button("✕", key=f"doc_{doc['id']}"):
                         current_project['documents'] = [d for d in current_project['documents'] if d['id'] != doc['id']]
                         st.rerun()
-        elif current_project:
-            st.caption("No documents added. AI will use knowledge base and Google Search.")
         
         st.markdown("---")
         
-        # RAG Document Content Search Section
-        st.markdown('<div class="sidebar-section">🔍 Document Content Search</div>', unsafe_allow_html=True)
-        
+        # ===== KNOWLEDGE BASE ACTIVE SECTION =====
+        # This section handles auto-indexing for Streamlit Cloud deployment
         if RAG_AVAILABLE:
             try:
                 rag_service = get_rag_service()
                 stats = rag_service.get_stats()
                 
-                if stats['total_chunks'] > 0:
-                    st.success(f"✅ {stats['total_chunks']} text chunks indexed")
-                    st.caption("The AI can now search inside your law documents!")
-                else:
-                    st.warning("⚠️ Documents not yet indexed")
-                    st.caption("Index your Law Resources folder to enable content search.")
+                # Check if we need to auto-index (first deployment or empty database)
+                resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
                 
-                # Index button
-                if st.button("🔄 Index Documents", use_container_width=True, help="Extract and index text from all law resources"):
+                # Auto-index on first startup if database is empty
+                if stats['total_chunks'] == 0 and not st.session_state.auto_index_triggered and os.path.exists(resources_path):
+                    st.session_state.auto_index_triggered = True
                     st.session_state.rag_indexing = True
                     st.rerun()
                 
-                # Show indexing progress
+                # Show indexing progress if currently indexing
                 if st.session_state.rag_indexing:
-                    resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
+                    st.markdown('<div class="sidebar-section">📚 Knowledge Base</div>', unsafe_allow_html=True)
+                    st.info("⏳ Auto-indexing law documents... Please wait.")
                     
-                    with st.spinner("Indexing documents... This may take a few minutes."):
+                    with st.spinner("Indexing documents... This may take a few minutes on first startup."):
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         
@@ -693,17 +686,39 @@ def main():
                         try:
                             result = rag_service.index_documents(resources_path, progress_callback)
                             st.session_state.rag_stats = result
+                            st.session_state.rag_indexed = True
+                            st.session_state.rag_chunk_count = result['chunks']
                             st.session_state.rag_indexing = False
-                            st.success(f"✅ Indexed {result['processed']} documents ({result['chunks']} chunks)")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Indexing error: {str(e)}")
                             st.session_state.rag_indexing = False
+                else:
+                    # Show Knowledge Base Active status
+                    st.markdown('<div class="sidebar-section">📚 Knowledge Base Active</div>', unsafe_allow_html=True)
+                    
+                    if stats['total_chunks'] > 0:
+                        st.success(f"✅ {stats['total_chunks']} text chunks indexed")
+                        st.caption("The AI can now search inside your law documents!")
+                    else:
+                        st.caption("No documents added. AI will use knowledge base and Google Search.")
+                        
+                        # Show manual index button if no documents indexed
+                        if os.path.exists(resources_path):
+                            if st.button("🔄 Index Law Documents", use_container_width=True, help="Extract and index text from all law resources"):
+                                st.session_state.rag_indexing = True
+                                st.rerun()
                 
             except Exception as e:
-                st.error(f"RAG Error: {str(e)}")
+                st.markdown('<div class="sidebar-section">📚 Knowledge Base Active</div>', unsafe_allow_html=True)
+                st.caption("No documents added. AI will use knowledge base and Google Search.")
         else:
-            st.info("📦 Install dependencies to enable content search:\n`pip install chromadb pymupdf python-docx`")
+            # RAG not available - show basic Knowledge Base status  
+            st.markdown('<div class="sidebar-section">📚 Knowledge Base Active</div>', unsafe_allow_html=True)
+            if st.session_state.knowledge_base_loaded:
+                st.caption("AI will use knowledge base and Google Search.")
+            else:
+                st.caption("No documents added. AI will use knowledge base and Google Search.")
         
         # Footer
         st.markdown("---")
