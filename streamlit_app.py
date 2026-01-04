@@ -752,52 +752,59 @@ def main():
                 render_message(msg, is_user)
         else:
             # EMPTY STATE - Show welcome screen with boxes
-            st.markdown("""
-            <div style="text-align: center; max-width: 40rem; margin: 3rem auto; padding: 2rem;">
-                <div style="font-size: 4rem; color: #dadce0; margin-bottom: 1rem;">📚</div>
-                <h2 style="font-family: 'Product Sans', sans-serif; font-size: 2rem; color: #202124; margin-bottom: 0.5rem;">Legal AI</h2>
-                <p style="color: #5f6368; font-size: 1rem; margin-bottom: 2rem;">AI-powered legal research assistant</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Knowledge Base Status
-            col1, col2, col3 = st.columns([1, 2, 1])
-            if st.session_state.knowledge_base_loaded:
+            # Use a placeholder so we can clear it immediately when user types
+            welcome_placeholder = st.empty()
+            with welcome_placeholder.container():
+                st.markdown("""
+                <div style="text-align: center; max-width: 40rem; margin: 3rem auto; padding: 2rem;">
+                    <div style="font-size: 4rem; color: #dadce0; margin-bottom: 1rem;">📚</div>
+                    <h2 style="font-family: 'Product Sans', sans-serif; font-size: 2rem; color: #202124; margin-bottom: 0.5rem;">Legal AI</h2>
+                    <p style="color: #5f6368; font-size: 1rem; margin-bottom: 2rem;">AI-powered legal research assistant</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Knowledge Base Status
+                col1, col2, col3 = st.columns([1, 2, 1])
+                if st.session_state.knowledge_base_loaded:
+                    with col2:
+                        st.success("✅ Knowledge Base Active")
+                
+                # Centered content - BIGGER BOXES with DARKER TEXT
                 with col2:
-                    st.success("✅ Knowledge Base Active")
-            
-            # Centered content - BIGGER BOXES with DARKER TEXT
-            with col2:
-                st.markdown('<p style="color: #202124; font-size: 1.25rem; font-weight: 500; text-align: center; margin: 2rem 0;">Just ask your question</p>', unsafe_allow_html=True)
-                
-                # Capabilities box - React Style (Blue Dots)
-                st.markdown("""
-                <div style="background: white; border: 1px solid #dadce0; border-radius: 0.75rem; padding: 2rem; margin: 1.5rem 0; text-align: left; box-shadow: 0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);">
-                    <h4 style="font-size: 0.75rem; font-weight: 700; color: #5f6368; text-transform: uppercase; margin-bottom: 1rem; letter-spacing: 0.5px;">Capabilities</h4>
-                    <div style="display: flex; flex-direction: column; gap: 0.75rem;">
-                        <div class="custom-list-item"><div class="blue-dot"></div>Essay Writing</div>
-                        <div class="custom-list-item"><div class="blue-dot"></div>Problem Questions</div>
-                        <div class="custom-list-item"><div class="blue-dot"></div>Legal Advice & Strategy</div>
-                        <div class="custom-list-item"><div class="blue-dot"></div>General Queries</div>
+                    st.markdown('<p style="color: #202124; font-size: 1.25rem; font-weight: 500; text-align: center; margin: 2rem 0;">Just ask your question</p>', unsafe_allow_html=True)
+                    
+                    # Capabilities box - React Style (Blue Dots)
+                    st.markdown("""
+                    <div style="background: white; border: 1px solid #dadce0; border-radius: 0.75rem; padding: 2rem; margin: 1.5rem 0; text-align: left; box-shadow: 0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);">
+                        <h4 style="font-size: 0.75rem; font-weight: 700; color: #5f6368; text-transform: uppercase; margin-bottom: 1rem; letter-spacing: 0.5px;">Capabilities</h4>
+                        <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                            <div class="custom-list-item"><div class="blue-dot"></div>Essay Writing</div>
+                            <div class="custom-list-item"><div class="blue-dot"></div>Problem Questions</div>
+                            <div class="custom-list-item"><div class="blue-dot"></div>Legal Advice & Strategy</div>
+                            <div class="custom-list-item"><div class="blue-dot"></div>General Queries</div>
+                        </div>
                     </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Tips box - React Style (Chips)
-                st.markdown("""
-                <div style="background: white; border: 1px solid #dadce0; border-radius: 0.75rem; padding: 2rem; margin: 1.5rem 0; text-align: left; box-shadow: 0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);">
-                    <h4 style="font-size: 0.75rem; font-weight: 700; color: #5f6368; margin-bottom: 1rem; letter-spacing: 0.5px; text-transform: uppercase; display: flex; align-items: center; gap: 0.5rem;">
-                        <span style="color: #eab308; font-size: 1rem;">✨</span> Try Asking
-                    </h4>
-                    <div style="display: flex; flex-direction: column; gap: 0.5rem;">
-                        <div class="suggestion-chip">"What are the key elements of a valid contract under English law?"</div>
-                        <div class="suggestion-chip">"Explain the duty of care in negligence under UK tort law"</div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Tips box - React Style (Chips)
+                    st.markdown("""
+                    <div style="background: white; border: 1px solid #dadce0; border-radius: 0.75rem; padding: 2rem; margin: 1.5rem 0; text-align: left; box-shadow: 0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);">
+                        <h4 style="font-size: 0.75rem; font-weight: 700; color: #5f6368; margin-bottom: 1rem; letter-spacing: 0.5px; text-transform: uppercase; display: flex; align-items: center; gap: 0.5rem;">
+                            <span style="color: #eab308; font-size: 1rem;">✨</span> Try Asking
+                        </h4>
+                        <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                            <div class="suggestion-chip">"What are the key elements of a valid contract under English law?"</div>
+                            <div class="suggestion-chip">"Explain the duty of care in negligence under UK tort law"</div>
+                        </div>
                     </div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
     
     # Input area - Docked at bottom (st.chat_input)
     if prompt := st.chat_input("Ask for an Essay, Case Analysis, or Client Advice..."):
+        # Clear welcome screen immediately if it exists
+        if 'welcome_placeholder' in locals():
+            welcome_placeholder.empty()
+            
         if current_project:
             # Add user message immediately
             user_message = {
