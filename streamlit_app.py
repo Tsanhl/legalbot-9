@@ -621,6 +621,7 @@ def main():
         if uploaded_files:
             current_project = get_current_project()
             if current_project:
+                files_added = False
                 for file in uploaded_files:
                     # Check if file already added
                     existing_names = [d['name'] for d in current_project['documents']]
@@ -634,23 +635,10 @@ def main():
                             'data': encode_file_to_base64(content),
                             'size': len(content)
                         })
-                st.rerun()
-        
-        # Document list
-        current_project = get_current_project()
-        if current_project and current_project['documents']:
-            st.markdown("---")
-            st.caption(f"**Documents ({len(current_project['documents'])})**")
-            for doc in current_project['documents']:
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    icon = "🔗" if doc['type'] == 'link' else "📄"
-                    size_text = "Web" if doc['type'] == 'link' else f"{doc['size']/1024:.1f} KB"
-                    st.caption(f"{icon} {doc['name'][:30]}... ({size_text})")
-                with col2:
-                    if st.button("✕", key=f"doc_{doc['id']}"):
-                        current_project['documents'] = [d for d in current_project['documents'] if d['id'] != doc['id']]
-                        st.rerun()
+                        files_added = True
+                # Only rerun after processing all files
+                if files_added:
+                    st.rerun()
         
         st.markdown("---")
         
