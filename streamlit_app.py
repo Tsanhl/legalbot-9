@@ -20,6 +20,13 @@ from gemini_service import (
     encode_file_to_base64
 )
 
+# RAG Service for document content retrieval
+try:
+    from rag_service import get_rag_service, RAGService
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+
 # Page configuration
 st.set_page_config(
     page_title="Legal AI",
@@ -151,9 +158,6 @@ section[data-testid="stSidebar"] label {
     transition: all 0.2s;
     border: none;
     box-shadow: none;
-    white-space: nowrap !important;
-    overflow: hidden;
-    text-overflow: ellipsis;
 }
 
 /* Force Primary Buttons to Google Blue */
@@ -308,44 +312,11 @@ section[data-testid="stSidebar"] [data-testid="column"] > div {
     border-bottom-left-radius: 4px;
 }
 
-/* Chat Role & Text */
-.chat-role {
-    font-size: 13px;
-    font-weight: 600;
-    margin-bottom: 8px;
-    letter-spacing: 0.3px;
-    color: #5f6368;
-}
-
-.chat-role.user { color: #1a73e8; }
-.chat-role.assistant { color: #5f6368; }
-
-.chat-text {
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-
-/* Ghost Button for Editing */
-.ghost-btn {
-    border: none !important;
-    background: transparent !important;
-    color: #dadce0 !important;
-    font-size: 14px !important;
-    cursor: pointer;
-    padding: 2px 8px !important;
-    border-radius: 4px !important;
-}
-
-.ghost-btn:hover {
-    color: #1a73e8 !important;
-    background: #e8f0fe !important;
-}
-
 /* Sidebar Section Headers */
 .sidebar-section {
-    font-size: 13px;
+    font-size: 13px; /* Slightly larger for readability */
     font-weight: 600;
-    color: var(--text-primary) !important;
+    color: var(--text-primary) !important; /* Force dark color */
     text-transform: uppercase;
     letter-spacing: 0.8px;
     margin: 24px 0 12px 0;
@@ -389,30 +360,6 @@ div[data-baseweb="modal"], div[class*="backdrop"] {
     display: none !important;
 }
 
-/* ULTRA-HARD RESET: Prevent any overlay/blur on top of main/right areas */
-[data-testid="stAppViewContainer"], 
-[data-testid="stMain"], 
-.main, 
-.block-container, 
-body, 
-html {
-    opacity: 1 !important;
-    filter: none !important;
-    backdrop-filter: none !important;
-}
-
-/* Kill all overlays, modals, or glass backgrounds */
-div[data-baseweb="modal"], 
-div[class*="backdrop"], 
-div[role="dialog"], 
-div[data-testid="stFileUploaderOverlay"], 
-div[aria-modal="true"] {
-    opacity: 0 !important;
-    pointer-events: none !important;
-    filter: none !important;
-    backdrop-filter: none !important;
-    background: transparent !important;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -451,15 +398,12 @@ def init_session_state():
     
     if 'renaming_project_id' not in st.session_state:
         st.session_state.renaming_project_id = None
-        
-    if 'editing_message_id' not in st.session_state:
-        st.session_state.editing_message_id = None
-        
-    if 'stop_generation' not in st.session_state:
-        st.session_state.stop_generation = False
-        
-    if 'auto_submit_prompt' not in st.session_state:
-        st.session_state.auto_submit_prompt = None
+    
+    if 'rag_indexing' not in st.session_state:
+        st.session_state.rag_indexing = False
+    
+    if 'rag_stats' not in st.session_state:
+        st.session_state.rag_stats = None
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -489,7 +433,8 @@ def parse_citations(text: str) -> str:
             json_str = match.group(0)[2:-2]  # Remove [[ and ]]
             citation = json.loads(json_str)
             ref = citation.get('ref', 'Citation')
-            return f'<span class="citation-btn" title="Click to view source">[{ref}]</span>'
+            # Format in proper OSCOLA style - just the reference in brackets
+            return f'({ref})'
         except:
             return match.group(0)
     
@@ -498,61 +443,29 @@ def parse_citations(text: str) -> str:
 def render_message(message: Dict, is_user: bool):
     """Render a chat message"""
     bubble_class = "user" if is_user else "assistant"
-    role_label = "You" if is_user else "LexCitator AI"
-    msg_id = message.get('id')
     
-    # Handle Editing State
-    if is_user and st.session_state.editing_message_id == msg_id:
-        with st.container():
-            st.markdown(f'<div class="chat-role user">{role_label} (Editing)</div>', unsafe_allow_html=True)
-            new_text = st.text_area("Edit your question", value=message.get('text', ''), key=f"edit_input_{msg_id}", label_visibility="collapsed")
-            col1, col2, _ = st.columns([1, 1, 4])
-            if col1.button("Save", key=f"save_{msg_id}"):
-                message['text'] = new_text
-                # Remove all messages AFTER this one
-                current_project = get_current_project()
-                if current_project:
-                    try:
-                        idx = current_project['messages'].index(message)
-                        current_project['messages'] = current_project['messages'][:idx+1]
-                    except ValueError:
-                        pass
-                st.session_state.editing_message_id = None
-                st.session_state.auto_submit_prompt = new_text
-                st.rerun()
-            if col2.button("Cancel", key=f"cancel_{msg_id}"):
-                st.session_state.editing_message_id = None
-                st.rerun()
-        return
-
-    # Normal Rendering
+    # Clean text (remove ** and * markdown)
     text = message.get('text', '')
     text = text.replace('**', '').replace('*', '')
+    
+    # Parse citations
     text_with_citations = parse_citations(text)
     
-    # Style for edit button
-    edit_btn_html = ""
     if is_user:
-        # We use a column layout to place the edit button nicely
-        col1, col2 = st.columns([15, 1])
-        with col1:
-            st.markdown(f"""
-            <div class="chat-message {bubble_class}">
-                <div class="chat-bubble {bubble_class}">
-                    <div class="chat-role {bubble_class}">{role_label}</div>
-                    <div class="chat-text">{text_with_citations}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col2:
-            if st.button("✎", key=f"edit_btn_{msg_id}", help="Edit this message", type="secondary"):
-                st.session_state.editing_message_id = msg_id
-                st.rerun()
-    else:
+        # User message with label
         st.markdown(f"""
-        <div class="chat-message {bubble_class}">
-            <div class="chat-bubble {bubble_class}">
-                <div class="chat-role {bubble_class}">{role_label}</div>
+        <div class="chat-message user">
+            <div class="chat-bubble user">
+                <div class="chat-role user">You</div>
+                <div class="chat-text">{text_with_citations}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # Assistant message - no label, just clean response
+        st.markdown(f"""
+        <div class="chat-message assistant">
+            <div class="chat-bubble assistant">
                 <div class="chat-text">{text_with_citations}</div>
             </div>
         </div>
@@ -595,7 +508,7 @@ def main():
         st.markdown("---")
         
         # Projects Section - Header and New button on same line
-        col_header, col_new = st.columns([2.5, 1])
+        col_header, col_new = st.columns([3, 1])
         with col_header:
             st.markdown(f'<div class="sidebar-section" style="display: flex; align-items: center; height: 38px; margin: 0;">📁 Projects ({len(st.session_state.projects)}/{MAX_PROJECTS})</div>', unsafe_allow_html=True)
         with col_new:
@@ -688,45 +601,31 @@ def main():
                     })
                     st.rerun()
         
-        # File upload with proper state management
-        if 'uploaded_file_ids' not in st.session_state:
-            st.session_state.uploaded_file_ids = set()
-        
+        # File upload
         uploaded_files = st.file_uploader(
             "Upload Files",
             type=['pdf', 'txt', 'md', 'csv'],
             accept_multiple_files=True,
-            key="file_uploader",
-            help="Maximum 200MB per file. Supports: PDF, TXT, MD, CSV"
+            key="file_uploader"
         )
         
         if uploaded_files:
             current_project = get_current_project()
             if current_project:
-                files_added = False
                 for file in uploaded_files:
-                    # Create a unique identifier for this file
-                    file_id = f"{file.name}_{file.size}"
-                    
-                    # Check if file already processed in this session
-                    if file_id not in st.session_state.uploaded_file_ids:
-                        # Check if file already exists in project by name
-                        existing_names = [d['name'] for d in current_project['documents']]
-                        if file.name not in existing_names:
-                            content = file.read()
-                            current_project['documents'].append({
-                                'id': str(uuid.uuid4()),
-                                'type': 'file',
-                                'name': file.name,
-                                'mimeType': file.type or 'application/octet-stream',
-                                'data': encode_file_to_base64(content),
-                                'size': len(content)
-                            })
-                            st.session_state.uploaded_file_ids.add(file_id)
-                            files_added = True
-                
-                if files_added:
-                    st.rerun()
+                    # Check if file already added
+                    existing_names = [d['name'] for d in current_project['documents']]
+                    if file.name not in existing_names:
+                        content = file.read()
+                        current_project['documents'].append({
+                            'id': str(uuid.uuid4()),
+                            'type': 'file',
+                            'name': file.name,
+                            'mimeType': file.type or 'application/octet-stream',
+                            'data': encode_file_to_base64(content),
+                            'size': len(content)
+                        })
+                st.rerun()
         
         # Knowledge Base Status
         if st.session_state.knowledge_base_loaded:
@@ -739,8 +638,72 @@ def main():
         else:
             st.info("⏳ Loading Knowledge Base...")
         
-        # Document list removal (requested to avoid duplication with uploader)
-        pass
+        # Document list
+        current_project = get_current_project()
+        if current_project and current_project['documents']:
+            st.markdown("---")
+            st.caption(f"**Documents ({len(current_project['documents'])})**")
+            for doc in current_project['documents']:
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    icon = "🔗" if doc['type'] == 'link' else "📄"
+                    size_text = "Web" if doc['type'] == 'link' else f"{doc['size']/1024:.1f} KB"
+                    st.caption(f"{icon} {doc['name'][:30]}... ({size_text})")
+                with col2:
+                    if st.button("✕", key=f"doc_{doc['id']}"):
+                        current_project['documents'] = [d for d in current_project['documents'] if d['id'] != doc['id']]
+                        st.rerun()
+        elif current_project:
+            st.caption("No documents added. AI will use knowledge base and Google Search.")
+        
+        st.markdown("---")
+        
+        # RAG Document Content Search Section
+        st.markdown('<div class="sidebar-section">🔍 Document Content Search</div>', unsafe_allow_html=True)
+        
+        if RAG_AVAILABLE:
+            try:
+                rag_service = get_rag_service()
+                stats = rag_service.get_stats()
+                
+                if stats['total_chunks'] > 0:
+                    st.success(f"✅ {stats['total_chunks']} text chunks indexed")
+                    st.caption("The AI can now search inside your law documents!")
+                else:
+                    st.warning("⚠️ Documents not yet indexed")
+                    st.caption("Index your Law Resources folder to enable content search.")
+                
+                # Index button
+                if st.button("🔄 Index Documents", use_container_width=True, help="Extract and index text from all law resources"):
+                    st.session_state.rag_indexing = True
+                    st.rerun()
+                
+                # Show indexing progress
+                if st.session_state.rag_indexing:
+                    resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
+                    
+                    with st.spinner("Indexing documents... This may take a few minutes."):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        def progress_callback(count, filename):
+                            progress_bar.progress(min(count / 500, 1.0))  # Estimate ~500 files
+                            status_text.text(f"Processing: {filename[:40]}...")
+                        
+                        try:
+                            result = rag_service.index_documents(resources_path, progress_callback)
+                            st.session_state.rag_stats = result
+                            st.session_state.rag_indexing = False
+                            st.success(f"✅ Indexed {result['processed']} documents ({result['chunks']} chunks)")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Indexing error: {str(e)}")
+                            st.session_state.rag_indexing = False
+                
+            except Exception as e:
+                st.error(f"RAG Error: {str(e)}")
+        else:
+            st.info("📦 Install dependencies to enable content search:\n`pip install chromadb pymupdf python-docx`")
         
         # Footer
         st.markdown("---")
@@ -748,7 +711,8 @@ def main():
         <div style="display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0;">
             <div class="ai-badge">AI</div>
             <div>
-                <div style="font-size: 0.875rem; font-weight: 500; color: #202124;">Gemini</div>
+                <div style="font-size: 0.875rem; font-weight: 500; color: #202124;">Gemini 3 Pro</div>
+                <div style="font-size: 0.75rem; color: #5f6368;">""" + ("Custom Key Active" if st.session_state.api_key else "Default Key Active") + """</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -756,161 +720,181 @@ def main():
     # ===== MAIN AREA =====
     current_project = get_current_project()
     
-    if current_project:
-        # 1. Header & Quick Actions
-        col1, col2 = st.columns([6, 1])
-        with col1:
-            st.markdown("### 📖 Legal Research Workspace")
-        with col2:
-            if st.button("Clear", type="secondary"):
+    # Header
+    col1, col2 = st.columns([6, 1])
+    with col1:
+        st.markdown("### 📖 Legal Research Workspace")
+    with col2:
+        if st.button("Clear", type="secondary"):
+            if current_project:
                 current_project['messages'] = []
                 reset_session(current_project['id'])
                 st.rerun()
-        st.markdown("---")
-
-        # 2. Capture Input (Early in script to update state)
-        if st.session_state.auto_submit_prompt:
-            prompt = st.session_state.auto_submit_prompt
-            st.session_state.auto_submit_prompt = None
-        else:
-            prompt = st.chat_input("Ask for an Essay, Case Analysis, or Client Advice...")
-
-        # 3. Workspace Rendering Mode Selection
+    
+    st.markdown("---")
+    
+    # Chat area
+    if current_project:
         messages = current_project.get('messages', [])
         
-        # Determine if we show the Welcome screen
-        # MUST only show if no history AND no active prompt is being sent
-        show_welcome = not messages and not prompt
-        
-        if show_welcome:
-            # === WELCOME SCREEN (The 3 elements) ===
+        # Check if there are any messages - if yes, show chat only
+        if len(messages) > 0:
+            # Display existing messages - NO BOXES
+            for msg in messages:
+                is_user = msg.get('role') == 'user'
+                render_message(msg, is_user)
+        else:
+            # EMPTY STATE - Show welcome screen with boxes
             st.markdown("""
-            <div style="text-align: center; max-width: 50rem; margin: 0 auto; padding: 2rem 2rem 0 2rem;">
-                <div style="font-size: 3.5rem; color: #dadce0; margin-bottom: 0.5rem;">📚</div>
-                <h2 style="font-family: 'Product Sans', sans-serif; font-size: 2.25rem; color: #202124; margin-bottom: 0.5rem; font-weight: 700;">Legal AI</h2>
-                <p style="color: #5f6368; font-size: 1.125rem; margin-bottom: 1rem;">Your distinguished legal scholar & academic writing expert</p>
-                <div style="color: #202124; font-size: 1.25rem; font-weight: 500; margin: 1rem 0 1.5rem 0;">Just ask your question</div>
+            <div style="text-align: center; max-width: 40rem; margin: 3rem auto; padding: 2rem;">
+                <div style="font-size: 4rem; color: #dadce0; margin-bottom: 1rem;">📚</div>
+                <h2 style="font-family: 'Product Sans', sans-serif; font-size: 2rem; color: #202124; margin-bottom: 0.5rem;">Legal AI</h2>
+                <p style="color: #5f6368; font-size: 1rem; margin-bottom: 2rem;">AI-powered legal research assistant</p>
             </div>
             """, unsafe_allow_html=True)
             
+            # Knowledge Base Status
+            col1, col2, col3 = st.columns([1, 2, 1])
             if st.session_state.knowledge_base_loaded:
-                # Use a specific container for the boxes to ensure spacing from chat input
-                with st.container():
-                    col_cap, col_try = st.columns(2)
-                    with col_cap:
-                        st.markdown("""
-                        <div style="background: white; border: 1px solid #dadce0; border-radius: 1rem; padding: 1.5rem; box-shadow: var(--card-shadow); height: 280px; display: flex; flex-direction: column;">
-                            <h4 style="font-size: 0.8rem; font-weight: 700; color: #5f6368; text-transform: uppercase; margin-bottom: 1.25rem; letter-spacing: 0.5px;">Capabilities</h4>
-                            <div class="custom-list-item"><div class="blue-dot"></div>Comprehensive Essay Writing</div>
-                            <div class="custom-list-item"><div class="blue-dot"></div>Legal Problem Question Analysis</div>
-                            <div class="custom-list-item"><div class="blue-dot"></div>Client Advice & Litigation Strategy</div>
-                            <div class="custom-list-item"><div class="blue-dot"></div>General Legal Queries</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    with col_try:
-                        st.markdown("""
-                        <div style="background: white; border: 1px solid #dadce0; border-radius: 1rem; padding: 1.5rem; box-shadow: var(--card-shadow); height: 280px; display: flex; flex-direction: column;">
-                            <h4 style="font-size: 0.8rem; font-weight: 700; color: #5f6368; margin-bottom: 1.25rem; letter-spacing: 0.5px; text-transform: uppercase;">✨ Try Asking</h4>
-                            <div class="suggestion-chip" style="margin-bottom: 8px;">"What are the key elements of a valid contract under English law?"</div>
-                            <div class="suggestion-chip">"Critically analyze the duty of care in UK tort law"</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                
-                # Large spacer at the bottom to prevent overlap with the chat input bar
-                st.markdown('<div style="margin-bottom: 150px;"></div>', unsafe_allow_html=True)
-        else:
-            # === CHAT WORKSPACE ===
-            # If a new prompt was just sent, add it to the message list before rendering
-            if prompt and (not messages or messages[-1]['text'] != prompt):
-                new_user_msg = {
-                    'id': str(uuid.uuid4()),
-                    'role': 'user',
-                    'text': prompt,
-                    'timestamp': datetime.now().isoformat()
-                }
-                current_project['messages'].append(new_user_msg)
-                messages = current_project['messages'] # Update local ref
-
-            # 1. Render History Loop
-            chat_placeholder = st.container()
-            with chat_placeholder:
-                for msg in messages:
-                    render_message(msg, msg['role'] == 'user')
+                with col2:
+                    st.success("✅ Knowledge Base Active")
             
-            # 2. Handle AI Generation (if this run was triggered by a prompt)
-            if prompt:
-                # Thinking State (Pic 2 style)
-                thinking_placeholder = st.empty()
-                with thinking_placeholder.container():
-                    st.markdown("""
-                    <div class="chat-message assistant">
-                        <div class="chat-bubble assistant">
-                            <div class="chat-role assistant">LexCitator AI</div>
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                <div class="thinking-spinner"></div>
-                                <div class="chat-text" style="color: #5f6368; font-style: italic;">Thinking...</div>
-                            </div>
-                        </div>
+            # Centered content - BIGGER BOXES with DARKER TEXT
+            with col2:
+                st.markdown('<p style="color: #202124; font-size: 1.25rem; font-weight: 500; text-align: center; margin: 2rem 0;">Just ask your question</p>', unsafe_allow_html=True)
+                
+                # Capabilities box - React Style (Blue Dots)
+                st.markdown("""
+                <div style="background: white; border: 1px solid #dadce0; border-radius: 0.75rem; padding: 2rem; margin: 1.5rem 0; text-align: left; box-shadow: 0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);">
+                    <h4 style="font-size: 0.75rem; font-weight: 700; color: #5f6368; text-transform: uppercase; margin-bottom: 1rem; letter-spacing: 0.5px;">Capabilities</h4>
+                    <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                        <div class="custom-list-item"><div class="blue-dot"></div>Essay Writing</div>
+                        <div class="custom-list-item"><div class="blue-dot"></div>Problem Questions</div>
+                        <div class="custom-list-item"><div class="blue-dot"></div>Legal Advice & Strategy</div>
+                        <div class="custom-list-item"><div class="blue-dot"></div>General Queries</div>
                     </div>
-                    <style>
-                    .thinking-spinner {
-                        width: 14px;
-                        height: 14px;
-                        border: 2px solid #dadce0;
-                        border-top: 2px solid #1a73e8;
-                        border-radius: 50%;
-                        animation: spin 1s linear infinite;
-                    }
-                    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-                    </style>
-                    """, unsafe_allow_html=True)
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Tips box - React Style (Chips)
+                st.markdown("""
+                <div style="background: white; border: 1px solid #dadce0; border-radius: 0.75rem; padding: 2rem; margin: 1.5rem 0; text-align: left; box-shadow: 0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15);">
+                    <h4 style="font-size: 0.75rem; font-weight: 700; color: #5f6368; margin-bottom: 1rem; letter-spacing: 0.5px; text-transform: uppercase; display: flex; align-items: center; gap: 0.5rem;">
+                        <span style="color: #eab308; font-size: 1rem;">✨</span> Try Asking
+                    </h4>
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+                        <div class="suggestion-chip">"What are the key elements of a valid contract under English law?"</div>
+                        <div class="suggestion-chip">"Explain the duty of care in negligence under UK tort law"</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # Input area - Docked at bottom (st.chat_input)
+    if prompt := st.chat_input("Ask for an Essay, Case Analysis, or Client Advice..."):
+        if current_project:
+            # Add user message immediately
+            user_message = {
+                'id': str(uuid.uuid4()),
+                'role': 'user',
+                'text': prompt,
+                'timestamp': datetime.now().isoformat()
+            }
+            current_project['messages'].append(user_message)
+            
+            # Display user message immediately
+            render_message(user_message, is_user=True)
+            
+            # Get API key
+            api_key = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
+            
+            if not api_key:
+                st.error("Please enter a Gemini API key in the sidebar configuration.")
+            else:
+                # Show thinking indicator
+                thinking_placeholder = st.empty()
+                thinking_placeholder.markdown("""
+                <div class="chat-message assistant">
+                    <div class="chat-bubble assistant" style="display: flex; align-items: center; gap: 8px;">
+                        <div style="display: flex; gap: 4px;">
+                            <span style="animation: pulse 1s infinite; opacity: 0.6;">●</span>
+                            <span style="animation: pulse 1s infinite 0.2s; opacity: 0.6;">●</span>
+                            <span style="animation: pulse 1s infinite 0.4s; opacity: 0.6;">●</span>
+                        </div>
+                        <span style="color: #5f6368; font-style: italic;">Thinking...</span>
+                    </div>
+                </div>
+                <style>
+                @keyframes pulse {
+                    0%, 100% { opacity: 0.3; }
+                    50% { opacity: 1; }
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                # Stream the response for faster display
+                response_placeholder = st.empty()
+                full_response = ""
+                
+                try:
+                    # Use streaming for faster response
+                    stream = send_message_with_docs(
+                        api_key,
+                        prompt,
+                        current_project.get('documents', []),
+                        current_project['id'],
+                        stream=True
+                    )
                     
-                    # Stop Button UI
-                    _, stop_col = st.columns([5, 1])
-                    if stop_col.button("Stop ⏹", key="stop_btn_active"):
-                        st.info("Generation halted.")
-                        st.rerun()
-
-                # Call Service
-                api_key = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
-                if not api_key:
-                    st.error("Please enter a Gemini API key in the sidebar.")
-                else:
-                    try:
-                        history = messages[:-1] # All messages except the newest prompt
-                        stream = send_message_with_docs(
-                            api_key, prompt, current_project.get('documents', []),
-                            current_project['id'], history=history, stream=True
-                        )
-                        
-                        # Once stream starts, remove thinking indicator
-                        thinking_placeholder.empty()
-                        
-                        # Streaming response
-                        response_text = ""
-                        message_placeholder = st.empty()
-                        for chunk in stream:
-                            if chunk.text:
-                                response_text += chunk.text
-                                display_text = response_text.replace('**', '').replace('*', '')
-                                message_placeholder.markdown(f"""
-                                <div class="chat-message assistant">
-                                    <div class="chat-bubble assistant">
-                                        <div class="chat-role assistant">LexCitator AI</div>
-                                        <div class="chat-text">{display_text}</div>
-                                    </div>
+                    # Clear thinking indicator once we start getting response
+                    first_chunk = True
+                    
+                    # Stream the response chunks
+                    for chunk in stream:
+                        if hasattr(chunk, 'text'):
+                            if first_chunk:
+                                thinking_placeholder.empty()
+                                first_chunk = False
+                            
+                            full_response += chunk.text
+                            # Clean and display progressively
+                            display_text = full_response.replace('**', '').replace('*', '')
+                            response_placeholder.markdown(f"""
+                            <div class="chat-message assistant">
+                                <div class="chat-bubble assistant">
+                                    <div class="chat-text">{display_text}</div>
                                 </div>
-                                """, unsafe_allow_html=True)
-                        
-                        # Save Final
-                        current_project['messages'].append({
-                            'id': str(uuid.uuid4()), 'role': 'assistant',
-                            'text': response_text, 'timestamp': datetime.now().isoformat(),
-                            'grounding_urls': []
-                        })
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error communicating with AI: {str(e)}")
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    # Clear placeholders
+                    thinking_placeholder.empty()
+                    response_placeholder.empty()
+                    
+                    # Add assistant message
+                    assistant_message = {
+                        'id': str(uuid.uuid4()),
+                        'role': 'assistant',
+                        'text': full_response,
+                        'timestamp': datetime.now().isoformat(),
+                        'grounding_urls': []
+                    }
+                    current_project['messages'].append(assistant_message)
+                    
+                except Exception as e:
+                    thinking_placeholder.empty()
+                    response_placeholder.empty()
+                    # Add error message
+                    error_message = {
+                        'id': str(uuid.uuid4()),
+                        'role': 'assistant',
+                        'text': f"I encountered an error: {str(e)}",
+                        'timestamp': datetime.now().isoformat(),
+                        'is_error': True
+                    }
+                    current_project['messages'].append(error_message)
+            
+            st.rerun()
 
 if __name__ == "__main__":
     main()
+
