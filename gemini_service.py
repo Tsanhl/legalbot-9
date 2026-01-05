@@ -901,10 +901,6 @@ def initialize_knowledge_base():
         return True
     return False
 
-
-    
-
-
 def get_or_create_chat(api_key: str, project_id: str, documents: List[Dict] = None, history: List[Dict] = None) -> Any:
     """Get or create a chat session for a project"""
     global current_api_key, chat_sessions, genai_client
@@ -979,7 +975,7 @@ def send_message_with_docs(
     # Build content parts
     parts = []
     
-    # RAG: Retrieve relevant content from local vector database
+    # RAG: Retrieve relevant content from indexed documents
     if RAG_AVAILABLE:
         try:
             rag_context = get_relevant_context(message, max_chunks=6)
