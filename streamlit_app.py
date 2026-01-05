@@ -266,6 +266,112 @@ section[data-testid="stSidebar"] [data-testid="column"] > div {
     background-color: #e8f0fe;
 }
 
+/* Google Search Sources Box */
+.sources-box {
+    margin-top: 1rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid #e0e0e0;
+    border-radius: 12px;
+    background: #ffffff;
+}
+
+.sources-box-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    color: #202124;
+    margin-bottom: 0.75rem;
+}
+
+.sources-box-header .help-icon {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1px solid #9aa0a6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: #9aa0a6;
+    cursor: help;
+}
+
+.source-link {
+    display: block;
+    color: #1a73e8;
+    font-size: 14px;
+    text-decoration: none;
+    padding: 4px 0;
+}
+
+.source-link:hover {
+    text-decoration: underline;
+}
+
+/* Google Search Suggestions Box */
+.search-suggestions-box {
+    margin-top: 1rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid #e0e0e0;
+    border-radius: 12px;
+    background: #ffffff;
+}
+
+.search-suggestions-header {
+    font-size: 14px;
+    font-weight: 500;
+    color: #202124;
+    margin-bottom: 4px;
+}
+
+.search-suggestions-subheader {
+    font-size: 12px;
+    color: #5f6368;
+    margin-bottom: 1rem;
+}
+
+.search-suggestions-subheader a {
+    color: #1a73e8;
+    text-decoration: none;
+}
+
+.search-suggestions-subheader a:hover {
+    text-decoration: underline;
+}
+
+.search-chip-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.search-chip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: #f8f9fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 20px;
+    font-size: 14px;
+    color: #202124;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+}
+
+.search-chip:hover {
+    background: #e8f0fe;
+    border-color: #1a73e8;
+}
+
+.search-chip .google-icon {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+}
+
 /* Project Cards - Clean & Minimal */
 .project-card {
     background-color: #ffffff;
@@ -364,6 +470,49 @@ div[data-baseweb="modal"], div[class*="backdrop"] {
     display: none !important;
 }
 
+/* Stop Button Style */
+.stop-button {
+    background-color: #dc3545 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 20px !important;
+    padding: 8px 20px !important;
+    font-weight: 500 !important;
+    cursor: pointer !important;
+    transition: background-color 0.2s !important;
+}
+
+.stop-button:hover {
+    background-color: #c82333 !important;
+}
+
+/* Edit Button on User Messages */
+.edit-btn {
+    background: transparent;
+    border: none;
+    color: #5f6368;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    opacity: 0.6;
+    transition: all 0.2s;
+}
+
+.edit-btn:hover {
+    background: #f1f3f4;
+    opacity: 1;
+    color: #1a73e8;
+}
+
+.user-message-wrapper {
+    position: relative;
+}
+
+.user-message-wrapper:hover .edit-btn {
+    opacity: 1;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -417,6 +566,18 @@ def init_session_state():
     
     if 'auto_index_triggered' not in st.session_state:
         st.session_state.auto_index_triggered = False
+    
+    if 'stop_streaming' not in st.session_state:
+        st.session_state.stop_streaming = False
+    
+    if 'editing_message_id' not in st.session_state:
+        st.session_state.editing_message_id = None
+    
+    if 'edit_text' not in st.session_state:
+        st.session_state.edit_text = ''
+    
+    if 'pending_edit_prompt' not in st.session_state:
+        st.session_state.pending_edit_prompt = None
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -453,9 +614,10 @@ def parse_citations(text: str) -> str:
     
     return re.sub(pattern, replace_citation, text)
 
-def render_message(message: Dict, is_user: bool):
+def render_message(message: Dict, is_user: bool, message_id: str = None, show_edit: bool = True):
     """Render a chat message"""
-    bubble_class = "user" if is_user else "assistant"
+    import html
+    import urllib.parse
     
     # Clean text (remove ** and * markdown)
     text = message.get('text', '')
@@ -464,10 +626,16 @@ def render_message(message: Dict, is_user: bool):
     # Parse citations
     text_with_citations = parse_citations(text)
     
+    # CRITICAL: Convert newlines to HTML line breaks for paragraph gaps to display
+    # Double newlines (\n\n) become paragraph breaks (<br><br>)
+    # Single newlines (\n) become line breaks (<br>)
+    text_with_citations = text_with_citations.replace('\n\n', '<br><br>')
+    text_with_citations = text_with_citations.replace('\n', '<br>')
+    
     if is_user:
-        # User message with label
+        # User message with label - rendered as HTML only (no interactive edit here)
         st.markdown(f"""
-        <div class="chat-message user">
+        <div class="chat-message user user-message-wrapper">
             <div class="chat-bubble user">
                 <div class="chat-role user">You</div>
                 <div class="chat-text">{text_with_citations}</div>
@@ -475,7 +643,11 @@ def render_message(message: Dict, is_user: bool):
         </div>
         """, unsafe_allow_html=True)
     else:
-        # Assistant message - no label, just clean response
+        # Get grounding data
+        grounding_sources = message.get('grounding_sources', [])
+        search_suggestions = message.get('search_suggestions', [])
+        
+        # Render the main message text
         st.markdown(f"""
         <div class="chat-message assistant">
             <div class="chat-bubble assistant">
@@ -483,6 +655,50 @@ def render_message(message: Dict, is_user: bool):
             </div>
         </div>
         """, unsafe_allow_html=True)
+        
+        # Render Sources box if available (as separate component)
+        if grounding_sources:
+            # Remove duplicates based on title
+            seen_titles = set()
+            unique_sources = []
+            for source in grounding_sources:
+                title = source.get('title', '')
+                if title and title not in seen_titles:
+                    seen_titles.add(title)
+                    unique_sources.append(source)
+            
+            if unique_sources:
+                sources_links = ""
+                for i, source in enumerate(unique_sources, 1):
+                    url = source.get('url', '#')
+                    title = html.escape(source.get('title', 'Source'))
+                    sources_links += f'<a href="{url}" target="_blank" class="source-link">{i}. {title}</a>'
+                
+                st.markdown(f"""
+                <div class="sources-box">
+                    <div class="sources-box-header">
+                        Sources <span class="help-icon" title="These sources were used by Google Search to provide this answer">?</span>
+                    </div>
+                    {sources_links}
+                </div>
+                """, unsafe_allow_html=True)
+        
+        # Render Search Suggestions box if available (as separate component)
+        if search_suggestions:
+            chips_html = ""
+            for suggestion in search_suggestions:
+                safe_suggestion = html.escape(suggestion)
+                search_url = f"https://www.google.com/search?q={urllib.parse.quote(suggestion)}"
+                chips_html += f'''<a href="{search_url}" target="_blank" class="search-chip"><svg class="google-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>{safe_suggestion}</a>'''
+            
+            st.markdown(f"""
+            <div class="search-suggestions-box">
+                <div class="search-suggestions-header">Search Suggestions</div>
+                <div class="search-chip-container">
+                    {chips_html}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 def main():
     init_session_state()
@@ -746,10 +962,65 @@ def main():
         
         # Check if there are any messages - if yes, show chat only
         if len(messages) > 0:
-            # Display existing messages - NO BOXES
-            for msg in messages:
+            # Display existing messages with edit functionality
+            for idx, msg in enumerate(messages):
                 is_user = msg.get('role') == 'user'
-                render_message(msg, is_user)
+                msg_id = msg.get('id', str(idx))
+                
+                # Check if this message is being edited
+                if is_user and st.session_state.editing_message_id == msg_id:
+                    # Show edit interface
+                    st.markdown("""
+                    <div class="chat-message user">
+                        <div class="chat-bubble user" style="padding: 8px;">
+                            <div class="chat-role user">You (Editing)</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Text area for editing
+                    edited_text = st.text_area(
+                        "Edit your question:",
+                        value=msg.get('text', ''),
+                        key=f"edit_area_{msg_id}",
+                        height=100,
+                        label_visibility="collapsed"
+                    )
+                    
+                    col1, col2 = st.columns([1, 1])
+                    with col1:
+                        if st.button("✓ Submit", key=f"submit_edit_{msg_id}", type="primary", use_container_width=True):
+                            if edited_text.strip():
+                                # Find index of the message being edited
+                                edit_idx = next((i for i, m in enumerate(messages) if m.get('id') == msg_id), None)
+                                if edit_idx is not None:
+                                    # Update the message text
+                                    messages[edit_idx]['text'] = edited_text.strip()
+                                    # Remove all messages after this one (including AI response)
+                                    current_project['messages'] = messages[:edit_idx + 1]
+                                    # Clear editing state
+                                    st.session_state.editing_message_id = None
+                                    # This will trigger a new AI response
+                                    st.session_state.pending_edit_prompt = edited_text.strip()
+                                    st.rerun()
+                    with col2:
+                        if st.button("✕ Cancel", key=f"cancel_edit_{msg_id}", use_container_width=True):
+                            st.session_state.editing_message_id = None
+                            st.rerun()
+                else:
+                    # Normal message display
+                    if is_user:
+                        # User message with Edit button
+                        col_msg, col_btn = st.columns([20, 1])
+                        with col_msg:
+                            render_message(msg, is_user=True, message_id=msg_id)
+                        with col_btn:
+                            if st.button("✎", key=f"edit_btn_{msg_id}", help="Edit this question"):
+                                st.session_state.editing_message_id = msg_id
+                                st.rerun()
+                    else:
+                        # Assistant message - no edit button
+                        render_message(msg, is_user=False)
         else:
             # EMPTY STATE - Show welcome screen with boxes
             # Use a placeholder so we can clear it immediately when user types
@@ -799,24 +1070,34 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
     
-    # Input area - Docked at bottom (st.chat_input)
-    if prompt := st.chat_input("Ask for an Essay, Case Analysis, or Client Advice..."):
+    # Check for pending edit prompt (from editing a previous message)
+    pending_prompt = st.session_state.pending_edit_prompt
+    if pending_prompt:
+        st.session_state.pending_edit_prompt = None  # Clear it
+        prompt = pending_prompt
+    else:
+        # Input area - Docked at bottom (st.chat_input)
+        prompt = st.chat_input("Ask for an Essay, Case Analysis, or Client Advice...")
+    
+    if prompt:
         # Clear welcome screen immediately if it exists
         if 'welcome_placeholder' in locals():
             welcome_placeholder.empty()
             
         if current_project:
-            # Add user message immediately
-            user_message = {
-                'id': str(uuid.uuid4()),
-                'role': 'user',
-                'text': prompt,
-                'timestamp': datetime.now().isoformat()
-            }
-            current_project['messages'].append(user_message)
-            
-            # Display user message immediately
-            render_message(user_message, is_user=True)
+            # Only add user message if this is a NEW prompt (not an edited one)
+            # Edited prompts already have the message in place
+            if not pending_prompt:
+                user_message = {
+                    'id': str(uuid.uuid4()),
+                    'role': 'user',
+                    'text': prompt,
+                    'timestamp': datetime.now().isoformat()
+                }
+                current_project['messages'].append(user_message)
+                
+                # Display user message immediately
+                render_message(user_message, is_user=True)
             
             # Get API key
             api_key = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
@@ -847,7 +1128,9 @@ def main():
                 
                 # Stream the response for faster display
                 response_placeholder = st.empty()
+                stop_button_placeholder = st.empty()
                 full_response = ""
+                was_stopped = False
                 
                 try:
                     # Use streaming for faster response
@@ -861,12 +1144,24 @@ def main():
                     
                     # Clear thinking indicator once we start getting response
                     first_chunk = True
+                    grounding_sources = []
+                    search_suggestions = []
+                    last_chunk = None
                     
                     # Stream the response chunks
                     for chunk in stream:
+                        # Check if stop was requested
+                        if st.session_state.stop_streaming:
+                            was_stopped = True
+                            st.session_state.stop_streaming = False
+                            break
+                            
+                        last_chunk = chunk  # Keep track of final chunk for metadata
                         if hasattr(chunk, 'text'):
                             if first_chunk:
                                 thinking_placeholder.empty()
+                                # Show Stop button
+                                stop_button_placeholder.button("⏹ Stop", key="stop_streaming_btn", type="secondary", on_click=lambda: setattr(st.session_state, 'stop_streaming', True))
                                 first_chunk = False
                             
                             full_response += chunk.text
@@ -880,19 +1175,86 @@ def main():
                             </div>
                             """, unsafe_allow_html=True)
                     
+                    # Clear stop button
+                    stop_button_placeholder.empty()
+                    
+                    # Extract grounding metadata from the final response
+                    if last_chunk is not None:
+                        try:
+                            # Try to get grounding metadata from candidates
+                            if hasattr(last_chunk, 'candidates') and last_chunk.candidates:
+                                candidate = last_chunk.candidates[0]
+                                
+                                # Access grounding_metadata - it's a Pydantic model in new library
+                                gm = getattr(candidate, 'grounding_metadata', None)
+                                if gm is not None:
+                                    print(f"DEBUG: grounding_metadata found!")
+                                    
+                                    # Extract grounding chunks (source URLs)
+                                    chunks = getattr(gm, 'grounding_chunks', None)
+                                    if chunks:
+                                        print(f"DEBUG: Found {len(chunks)} grounding_chunks")
+                                        for gc in chunks:
+                                            web = getattr(gc, 'web', None)
+                                            if web:
+                                                url = getattr(web, 'uri', '') or ''
+                                                title = getattr(web, 'title', '') or ''
+                                                print(f"DEBUG: Source - {title}: {url}")
+                                                grounding_sources.append({
+                                                    'url': url,
+                                                    'title': title
+                                                })
+                                    else:
+                                        print("DEBUG: No grounding_chunks found")
+                                    
+                                    # Extract web_search_queries for suggestions
+                                    queries = getattr(gm, 'web_search_queries', None)
+                                    if queries:
+                                        search_suggestions = list(queries)
+                                        print(f"DEBUG: web_search_queries: {search_suggestions}")
+                                    else:
+                                        print("DEBUG: No web_search_queries found")
+                                    
+                                    # Try search_entry_point for rendered search widget
+                                    sep = getattr(gm, 'search_entry_point', None)
+                                    if sep:
+                                        rendered = getattr(sep, 'rendered_content', None)
+                                        if rendered:
+                                            print(f"DEBUG: search_entry_point rendered_content (first 200 chars): {rendered[:200]}")
+                                else:
+                                    print("DEBUG: No grounding_metadata on candidate")
+                                    
+                        except Exception as meta_e:
+                            print(f"Could not extract grounding metadata: {meta_e}")
+                            import traceback
+                            traceback.print_exc()
+                    
+                    # Debug: Print what we collected
+                    print(f"DEBUG: Final grounding_sources count: {len(grounding_sources)}")
+                    print(f"DEBUG: Final search_suggestions count: {len(search_suggestions)}")
+                    
                     # Clear placeholders
                     thinking_placeholder.empty()
                     response_placeholder.empty()
                     
-                    # Add assistant message
-                    assistant_message = {
-                        'id': str(uuid.uuid4()),
-                        'role': 'assistant',
-                        'text': full_response,
-                        'timestamp': datetime.now().isoformat(),
-                        'grounding_urls': []
-                    }
-                    current_project['messages'].append(assistant_message)
+                    # Add assistant message with grounding data
+                    # If stopped, add indicator to the response
+                    final_response = full_response
+                    if was_stopped and full_response:
+                        final_response = full_response + "\n\n[Response stopped by user]"
+                    
+                    # Only add message if there's content
+                    if final_response.strip():
+                        assistant_message = {
+                            'id': str(uuid.uuid4()),
+                            'role': 'assistant',
+                            'text': final_response,
+                            'timestamp': datetime.now().isoformat(),
+                            'grounding_sources': grounding_sources if not was_stopped else [],
+                            'search_suggestions': search_suggestions if not was_stopped else [],
+                            'was_stopped': was_stopped
+                        }
+                        current_project['messages'].append(assistant_message)
                     
                 except Exception as e:
                     thinking_placeholder.empty()

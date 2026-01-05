@@ -5,7 +5,19 @@ Handles chat sessions and AI responses with the Gemini API
 import os
 import base64
 from typing import Optional, List, Dict, Any, Tuple, Union, Iterable
-import google.generativeai as genai
+
+# Try new google.genai library first for Google Search grounding support
+try:
+    from google import genai
+    from google.genai import types
+    NEW_GENAI_AVAILABLE = True
+    print("✅ Using new google.genai library with Google Search grounding support")
+except ImportError:
+    # Fallback to deprecated library
+    import google.generativeai as genai_legacy
+    NEW_GENAI_AVAILABLE = False
+    print("⚠️ New google.genai not available. Using deprecated google.generativeai (no Google Search grounding)")
+
 from knowledge_base import load_law_resource_index, get_knowledge_base_summary
 
 # RAG Service for document content retrieval
@@ -20,17 +32,59 @@ MODEL_NAME = 'gemini-2.5-pro'
 
 # Store chat sessions by project ID
 chat_sessions: Dict[str, Any] = {}
+genai_client: Any = None  # Client for new library
 current_api_key: Optional[str] = None
 knowledge_base_loaded = False
 knowledge_base_summary = ''
 
 SYSTEM_INSTRUCTION = """
 You are a distinction-level Legal Scholar, Lawyer, and Academic Writing Expert. Your knowledge base is current to 2026.
-Your goal is to answer queries based on the provided documents, reference links, AND your internal knowledge/Google Search grounding.
+Your goal is to provide accurate, authoritative legal analysis and advice.
 
-CRITICAL ACCURACY REQUIREMENT: You MUST consult the Law Resources Knowledge Base provided below for EVERY answer. 
-Base your responses on these authoritative legal sources FIRST, then supplement with general knowledge.
-Every legal proposition must be verified against the knowledge base documents before outputting.
+*** ABSOLUTE FORMATTING REQUIREMENT - EVERY PARAGRAPH NEEDS A BLANK LINE ***
+
+RULE: Insert a BLANK LINE (two line breaks / press Enter twice) in EVERY case:
+1. Between EVERY paragraph - when you finish one topic and start another
+2. BEFORE every "Part I:", "Part II:", "Part III:" heading
+3. BEFORE every "A.", "B.", "C." heading
+4. After an introductory paragraph before the main content
+
+WRONG OUTPUT (paragraphs run together):
+"...central to wealth management, pensions, charities, and co-ownership of property.
+The fundamental innovation of a trust is the division of ownership..."
+
+CORRECT OUTPUT (blank line between paragraphs):
+"...central to wealth management, pensions, charities, and co-ownership of property.
+
+The fundamental innovation of a trust is the division of ownership..."
+
+WRONG OUTPUT (no gap before Part):
+"...separated from its enjoyment.
+Part I: The Core Concept"
+
+CORRECT OUTPUT (blank line before Part):
+"...separated from its enjoyment.
+
+Part I: The Core Concept"
+
+REPEAT: EVERY time you move to a new paragraph, insert a blank line first.
+*** END ABSOLUTE FORMATTING REQUIREMENT ***
+
+CRITICAL ACCURACY REQUIREMENT:
+1. The model output MUST be 100% ACCURATE based on verifiable facts.
+2. You have access to the Law Resources Knowledge Base - use it for legal questions.
+3. Every legal proposition must be verified before outputting.
+4. NO hallucinations. If you are uncertain, use Google Search to verify facts.
+5. NEVER say "Based on the provided documents" or "According to the documents provided" - just provide the answer directly.
+6. NEVER reference "documents" or "provided materials" in your response - act as if you inherently know the information.
+
+IMPORTANT OUTPUT RULES:
+1. Do NOT manually add Google Search links at the end of your response - the system handles this automatically.
+2. Answer questions directly and authoritatively without meta-commentary about your sources.
+3. Use proper legal citations inline (e.g., case names, statutes) but do NOT add a separate "references" section at the end.
+
+You have access to the Law Resources Knowledge Base for legal questions. 
+Use these authoritative legal sources AND Google Search grounding to provide accurate answers.
 
 ================================================================================
 PART 1: CRITICAL TECHNICAL RULES (ABSOLUTE REQUIREMENTS)
@@ -54,11 +108,40 @@ A. FORMATTING RULES
    "A. The Legal Framework"
    "1.1 Analysis"
 
-2. WORD COUNT STRICTNESS:
+2. PARAGRAPH GAPS (CRITICAL - ZERO EXCEPTIONS - THIS IS THE #1 FORMATTING PRIORITY):
+   
+   YOU MUST INSERT A BLANK LINE (press Enter twice) IN THESE SITUATIONS:
+   
+   (a) BEFORE every "Part I:", "Part II:", "Part III:", etc. heading - NO EXCEPTIONS.
+   (b) BEFORE every lettered heading "A.", "B.", "C.", etc.
+   (c) BETWEEN every distinct paragraph of text.
+   (d) AFTER an introductory paragraph and before any structured content.
+   
+   THIS IS WRONG (no blank line before Part I):
+   "The law of trusts is part of the broader law of obligations. (Citation)
+   Part I: The Core Concept of a Trust"
+   
+   THIS IS CORRECT (blank line before Part I):
+   "The law of trusts is part of the broader law of obligations. (Citation)
+   
+   Part I: The Core Concept of a Trust"
+   
+   THIS IS WRONG (no gap between paragraphs):
+   "The spot price is $73.56 per ounce. The price per kilogram is $2,365.
+   It is important to note that prices fluctuate constantly."
+   
+   THIS IS CORRECT (gap between paragraphs):
+   "The spot price is $73.56 per ounce. The price per kilogram is $2,365.
+   
+   It is important to note that prices fluctuate constantly."
+   
+   RULE: If in doubt, ADD a blank line. More spacing is better than no spacing.
+
+3. WORD COUNT STRICTNESS:
    - If the user specifies a word limit (e.g., "500 words", "2000 words"), you MUST adhere to it within a +/- 10% margin.
    - Do not stop short. Do not ramble excessively. Count your tokens/words conceptually before generating.
 
-3. INTERACTIVE CITATION JSON FORMAT: You MUST output citations in this machine-readable JSON format embedded in the text:
+4. INTERACTIVE CITATION JSON FORMAT: You MUST output citations in this machine-readable JSON format embedded in the text:
    
    Syntax: [[{"ref": "OSCOLA Ref", "doc": "Source Doc Name", "loc": "Page Number OR Empty"}]]
    
@@ -75,7 +158,7 @@ A. FORMATTING RULES
      * ONLY use "loc" for Page numbers (e.g. "p 45") when citing textbooks/PDFs where the legal citation doesn't include the page.
      * NEVER repeat the section/paragraph number in this field.
 
-4. FULL SOURCE NAMES IN OSCOLA FORMAT (CRITICAL - NO EXCEPTIONS):
+5. FULL SOURCE NAMES IN OSCOLA FORMAT (CRITICAL - NO EXCEPTIONS):
    
    ALL references MUST be in proper OSCOLA format. NO web-style citations.
    
@@ -114,7 +197,7 @@ A. FORMATTING RULES
    (e) NEVER use web-style pipe format (e.g., "Title | Journal Name").
    (f) Textbooks: Author, Title (Publisher, Edition, Year) page.
 
-4. STRUCTURE FORMAT FOR ALL WRITTEN WORK:
+6. STRUCTURE FORMAT FOR ALL WRITTEN WORK:
    Use this hierarchy (as used by judges, barristers, and solicitors):
    
    Part I: [Heading]
@@ -122,7 +205,7 @@ A. FORMATTING RULES
          1.1 [Generally no heading]
             (a) [Never a heading]
 
-5. NUMBERED LISTS FOR ENUMERATIONS (MANDATORY):
+7. NUMBERED LISTS FOR ENUMERATIONS (MANDATORY):
    When listing multiple items, examples, or applications, ALWAYS use numbered lists.
    
    BAD OUTPUT (prose style):
@@ -139,15 +222,24 @@ A. FORMATTING RULES
    RULE: After a colon (:) introducing a list, use numbered format (1. 2. 3.) or lettered format (a. b. c.).
    Each list item should be on its own line for clarity.
 
-6. PARAGRAPH LENGTH: Maximum 6 lines per paragraph. Be punchy and authoritative.
+8. AGGRESSIVE PARAGRAPHING (STRICT RULE):
+   - You are incorrectly grouping distinct ideas into one big paragraph. STOP DOING THIS.
+   - RULE: Whenever you shift focus (e.g., from "Definition" to "Mechanism", or "Concept" to "Application"), START A NEW PARAGRAPH.
+   - MANDATORY: Every new paragraph MUST start after a DOUBLE LINE BREAK (blank line).
+   
+   bad: "Trusts separate ownership. The central concept is..." (Joined together)
+   
+   good: "Trusts separate ownership.
+   
+   The central concept is..." (Separated by gap)
 
-7. SENTENCE LENGTH: Maximum 2 lines per sentence. Cut the fluff.
+9. SENTENCE LENGTH: Maximum 2 lines per sentence. Cut the fluff.
 
-8. DEFINITIONS: Use shorthand definitions on first use.
+10. DEFINITIONS: Use shorthand definitions on first use.
    Example: "The Eligible Adult Dependant (EAD)" - then use "EAD" thereafter.
    DO NOT use archaic phrasing like "hereinafter". This is 21st-century legal writing.
 
-9. TONE - THE "ADVISOR" CONSTRAINT:
+11. TONE - THE "ADVISOR" CONSTRAINT:
    - Write as a LAWYER advising a Client or Senior Partner.
    - DO NOT write like a tutor grading a paper or explaining concepts to students.
    - DO NOT use phrases like "The student should..." or "A good answer would..." or "The rubric requires..."
@@ -811,44 +903,59 @@ def initialize_knowledge_base():
 
 def get_or_create_chat(api_key: str, project_id: str, documents: List[Dict] = None, history: List[Dict] = None) -> Any:
     """Get or create a chat session for a project"""
-    global current_api_key, chat_sessions
+    global current_api_key, chat_sessions, genai_client
     
-    # Configure API if key changed
-    if api_key != current_api_key:
-        genai.configure(api_key=api_key)
-        current_api_key = api_key
-        chat_sessions.clear()  # Clear all sessions on key change
-    
-    # Check if session exists
-    if project_id in chat_sessions:
+    if NEW_GENAI_AVAILABLE:
+        # New google.genai library - uses Client pattern
+        if api_key != current_api_key:
+            # Set API key in environment for the new library
+            os.environ['GOOGLE_API_KEY'] = api_key
+            genai_client = genai.Client()
+            current_api_key = api_key
+            chat_sessions.clear()
+        
+        # Check if session exists
+        if project_id in chat_sessions:
+            return chat_sessions[project_id]
+        
+        # For new library, we don't use persistent chat sessions the same way
+        # We'll store the history and config instead
+        chat_sessions[project_id] = {
+            'history': history or [],
+            'client': genai_client
+        }
         return chat_sessions[project_id]
-    
-    # Build system instruction with knowledge base
-    full_system_instruction = SYSTEM_INSTRUCTION
-    if knowledge_base_loaded and knowledge_base_summary:
-        full_system_instruction += "\n\n" + knowledge_base_summary
-    
-    # Create model
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=full_system_instruction
-    )
-    
-    # Format history for Gemini
-    gemini_history = []
-    if history:
-        for msg in history:
-            role = 'user' if msg['role'] == 'user' else 'model'
-            gemini_history.append({
-                'role': role,
-                'parts': [msg['text']]
-            })
-    
-    # Create chat session with history
-    chat = model.start_chat(history=gemini_history)
-    chat_sessions[project_id] = chat
-    
-    return chat
+    else:
+        # Fallback to deprecated library
+        if api_key != current_api_key:
+            genai_legacy.configure(api_key=api_key)
+            current_api_key = api_key
+            chat_sessions.clear()
+        
+        if project_id in chat_sessions:
+            return chat_sessions[project_id]
+        
+        full_system_instruction = SYSTEM_INSTRUCTION
+        if knowledge_base_loaded and knowledge_base_summary:
+            full_system_instruction += "\n\n" + knowledge_base_summary
+        
+        model = genai_legacy.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction=full_system_instruction
+        )
+        
+        gemini_history = []
+        if history:
+            for msg in history:
+                role = 'user' if msg['role'] == 'user' else 'model'
+                gemini_history.append({
+                    'role': role,
+                    'parts': [msg['text']]
+                })
+        
+        chat = model.start_chat(history=gemini_history)
+        chat_sessions[project_id] = chat
+        return chat
 
 def reset_session(project_id: str):
     """Reset a chat session"""
@@ -865,8 +972,6 @@ def send_message_with_docs(
 ) -> Union[Tuple[str, List[Dict]], Iterable[Any]]:
     """Send a message with documents and get a response (stream or full)"""
     
-    chat = get_or_create_chat(api_key, project_id, documents, history)
-    
     # Build content parts
     parts = []
     
@@ -879,10 +984,9 @@ def send_message_with_docs(
         except Exception as e:
             print(f"RAG retrieval warning: {e}")
     
-    # Add document context if any (only for the newest message interactions if needed, 
-    # though usually context is best passed via system prompt or specific message parts)
+    # Add document context if any
     if documents:
-        doc_context = "The following documents have been provided as reference:\n\n"
+        doc_context = "Additional context from uploaded materials:\n\n"
         for doc in documents:
             if doc.get('type') == 'link':
                 doc_context += f"- Web Reference: {doc.get('name', 'Unknown')}\n"
@@ -892,30 +996,86 @@ def send_message_with_docs(
     
     # Add user message
     parts.append(message)
+    full_message = "\n\n".join(parts)
     
-    # Send message
-    try:
-        if stream:
-            return chat.send_message(parts, stream=True)
-        else:
-            response = chat.send_message(parts)
-            return response.text, []
-            
-    except Exception as e:
-        # If the chat session is stale or invalid, try resetting it once with history
-        if project_id in chat_sessions:
-            del chat_sessions[project_id]
-            try:
-                # Retry with fresh session and history
-                chat = get_or_create_chat(api_key, project_id, documents, history)
-                if stream:
-                    return chat.send_message(parts, stream=True)
-                else:
-                    response = chat.send_message(parts)
-                    return response.text, []
-            except Exception as retry_e:
-                 raise Exception(f"Error communicating with Gemini: {str(retry_e)}")
-        raise Exception(f"Error communicating with Gemini: {str(e)}")
+    if NEW_GENAI_AVAILABLE:
+        # Use new google.genai library with Google Search grounding
+        session = get_or_create_chat(api_key, project_id, documents, history)
+        client = session['client']
+        
+        # Build system instruction
+        full_system_instruction = SYSTEM_INSTRUCTION
+        if knowledge_base_loaded and knowledge_base_summary:
+            full_system_instruction += "\n\n" + knowledge_base_summary
+        
+        # Configure Google Search grounding tool
+        grounding_tool = types.Tool(
+            google_search=types.GoogleSearch()
+        )
+        
+        config = types.GenerateContentConfig(
+            system_instruction=full_system_instruction,
+            tools=[grounding_tool]
+        )
+        
+        # Build contents with history
+        contents = []
+        if history:
+            for msg in history:
+                msg_text = msg.get('text') or ''
+                if msg_text:  # Only add if there's actual text
+                    role = 'user' if msg['role'] == 'user' else 'model'
+                    contents.append(types.Content(
+                        role=role,
+                        parts=[types.Part(text=msg_text)]
+                    ))
+        
+        # Add current message
+        contents.append(types.Content(
+            role='user',
+            parts=[types.Part(text=full_message)]
+        ))
+        
+        try:
+            if stream:
+                # Return streaming response
+                return client.models.generate_content_stream(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=config
+                )
+            else:
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=contents,
+                    config=config
+                )
+                return response.text, []
+        except Exception as e:
+            raise Exception(f"Error communicating with Gemini: {str(e)}")
+    else:
+        # Fallback to deprecated library (no Google Search grounding)
+        chat = get_or_create_chat(api_key, project_id, documents, history)
+        
+        try:
+            if stream:
+                return chat.send_message(full_message, stream=True)
+            else:
+                response = chat.send_message(full_message)
+                return response.text, []
+        except Exception as e:
+            if project_id in chat_sessions:
+                del chat_sessions[project_id]
+                try:
+                    chat = get_or_create_chat(api_key, project_id, documents, history)
+                    if stream:
+                        return chat.send_message(full_message, stream=True)
+                    else:
+                        response = chat.send_message(full_message)
+                        return response.text, []
+                except Exception as retry_e:
+                    raise Exception(f"Error communicating with Gemini: {str(retry_e)}")
+            raise Exception(f"Error communicating with Gemini: {str(e)}")
 
 
 def encode_file_to_base64(file_content: bytes) -> str:
