@@ -8,3 +8,4 @@ watchdog
 PyMuPDF
 python-docx
 chromadb
+pinecone

@@ -18,10 +18,10 @@ from gemini_service import (
     send_message_with_docs, 
     reset_session,
     encode_file_to_base64,
-    initialize_gemini_files,
-    upload_documents_to_gemini,
-    get_gemini_files,
-    FILES_API_AVAILABLE
+    initialize_pinecone,
+    index_documents_to_pinecone,
+    get_pinecone_rag,
+    PINECONE_AVAILABLE
 )
 
 # RAG Service for document content retrieval
@@ -583,11 +583,14 @@ def init_session_state():
     if 'pending_edit_prompt' not in st.session_state:
         st.session_state.pending_edit_prompt = None
     
-    if 'gemini_files_uploading' not in st.session_state:
-        st.session_state.gemini_files_uploading = False
+    if 'pinecone_api_key' not in st.session_state:
+        st.session_state.pinecone_api_key = os.environ.get('PINECONE_API_KEY', '')
     
-    if 'gemini_files_count' not in st.session_state:
-        st.session_state.gemini_files_count = 0
+    if 'pinecone_indexing' not in st.session_state:
+        st.session_state.pinecone_indexing = False
+    
+    if 'pinecone_indexed' not in st.session_state:
+        st.session_state.pinecone_indexed = False
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -743,6 +746,17 @@ def main():
         )
         if api_key != st.session_state.api_key:
             st.session_state.api_key = api_key
+        
+        # Pinecone API Key for cloud vector storage
+        pinecone_key = st.text_input(
+            "Pinecone API Key (Cloud Storage)",
+            value=st.session_state.pinecone_api_key,
+            type="password",
+            placeholder="Enter Pinecone API Key...",
+            help="For persistent cloud document storage. Get free key at pinecone.io"
+        )
+        if pinecone_key != st.session_state.pinecone_api_key:
+            st.session_state.pinecone_api_key = pinecone_key
         
         st.markdown("---")
         
@@ -938,50 +952,68 @@ def main():
             else:
                 st.caption("No documents added. AI will use knowledge base and Google Search.")
         
-        # Gemini Cloud Upload Section (Alternative to local RAG)
+        # Pinecone Cloud Storage Section
         st.markdown("---")
-        st.markdown('<div class="sidebar-section">☁️ Cloud Document Storage</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-section">☁️ Pinecone Cloud Storage</div>', unsafe_allow_html=True)
         
-        api_key_for_upload = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
+        pinecone_key = st.session_state.pinecone_api_key
+        gemini_key = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
         resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
         
-        if FILES_API_AVAILABLE and api_key_for_upload:
-            # Check if we have uploaded files
-            files_service = get_gemini_files()
-            if files_service:
-                uploaded = files_service.get_uploaded_files()
-                if uploaded:
-                    st.success(f"☁️ {len(uploaded)} documents in Gemini Cloud")
-                    st.caption("Documents persist for 48 hours in Google's cloud.")
+        if PINECONE_AVAILABLE and pinecone_key:
+            # Initialize Pinecone if not already done
+            pinecone_service = get_pinecone_rag()
+            if pinecone_service is None and gemini_key:
+                pinecone_service = initialize_pinecone(pinecone_key, gemini_key)
             
-            # Show upload button if documents exist
+            if pinecone_service:
+                try:
+                    stats = pinecone_service.get_stats()
+                    if stats.get('total_vectors', 0) > 0:
+                        st.success(f"☁️ {stats['total_vectors']} vectors in cloud")
+                        st.caption("Documents persist permanently in Pinecone!")
+                        st.session_state.pinecone_indexed = True
+                    else:
+                        st.info("Cloud index is empty. Index your documents below.")
+                except Exception as e:
+                    st.warning(f"Could not check Pinecone status: {e}")
+            
+            # Show indexing UI
             if os.path.exists(resources_path):
-                if st.session_state.gemini_files_uploading:
-                    st.info("⏳ Uploading to Gemini Cloud... Please wait.")
-                    with st.spinner("Uploading documents to Google's cloud storage..."):
+                if st.session_state.pinecone_indexing:
+                    st.info("⏳ Indexing to Pinecone Cloud... This may take a while.")
+                    with st.spinner("Uploading documents to Pinecone..."):
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         
-                        def upload_progress(current, total, filename, status):
-                            progress_bar.progress(current / total if total > 0 else 0)
-                            status_text.text(f"{status}: {filename[:30]}...")
+                        def pinecone_progress(count, filename):
+                            progress_bar.progress(min(count / 500, 1.0))
+                            status_text.text(f"Processing: {filename[:35]}...")
                         
                         try:
-                            result = upload_documents_to_gemini(api_key_for_upload, resources_path, upload_progress)
-                            st.session_state.gemini_files_count = result.get('uploaded', 0) + result.get('cached', 0)
-                            st.session_state.gemini_files_uploading = False
+                            result = index_documents_to_pinecone(
+                                pinecone_key, 
+                                gemini_key, 
+                                resources_path, 
+                                pinecone_progress
+                            )
+                            st.session_state.pinecone_indexed = True
+                            st.session_state.pinecone_indexing = False
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Upload error: {str(e)}")
-                            st.session_state.gemini_files_uploading = False
+                            st.error(f"Indexing error: {str(e)}")
+                            st.session_state.pinecone_indexing = False
                 else:
-                    if st.button("☁️ Upload to Gemini Cloud", use_container_width=True, 
-                                help="Upload documents to Google's cloud (persists 48 hours, no local indexing needed)"):
-                        st.session_state.gemini_files_uploading = True
-                        initialize_gemini_files(api_key_for_upload)
-                        st.rerun()
+                    if not st.session_state.pinecone_indexed:
+                        if st.button("☁️ Index to Pinecone Cloud", use_container_width=True,
+                                    help="Upload documents to Pinecone (persists forever, even on free tier!)"):
+                            st.session_state.pinecone_indexing = True
+                            st.rerun()
         else:
-            st.caption("Enter API key to enable cloud upload.")
+            if not pinecone_key:
+                st.caption("Enter Pinecone API key above to enable cloud storage.")
+            elif not PINECONE_AVAILABLE:
+                st.caption("Pinecone library not installed.")
         
         # Footer
         st.markdown("---")
