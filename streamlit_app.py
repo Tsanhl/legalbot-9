@@ -17,11 +17,7 @@ from gemini_service import (
     initialize_knowledge_base, 
     send_message_with_docs, 
     reset_session,
-    encode_file_to_base64,
-    initialize_pinecone,
-    index_documents_to_pinecone,
-    get_pinecone_rag,
-    PINECONE_AVAILABLE
+    encode_file_to_base64
 )
 
 # RAG Service for document content retrieval
@@ -582,15 +578,6 @@ def init_session_state():
     
     if 'pending_edit_prompt' not in st.session_state:
         st.session_state.pending_edit_prompt = None
-    
-    if 'pinecone_api_key' not in st.session_state:
-        st.session_state.pinecone_api_key = os.environ.get('PINECONE_API_KEY', '')
-    
-    if 'pinecone_indexing' not in st.session_state:
-        st.session_state.pinecone_indexing = False
-    
-    if 'pinecone_indexed' not in st.session_state:
-        st.session_state.pinecone_indexed = False
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -746,17 +733,6 @@ def main():
         )
         if api_key != st.session_state.api_key:
             st.session_state.api_key = api_key
-        
-        # Pinecone API Key for cloud vector storage
-        pinecone_key = st.text_input(
-            "Pinecone API Key (Cloud Storage)",
-            value=st.session_state.pinecone_api_key,
-            type="password",
-            placeholder="Enter Pinecone API Key...",
-            help="For persistent cloud document storage. Get free key at pinecone.io"
-        )
-        if pinecone_key != st.session_state.pinecone_api_key:
-            st.session_state.pinecone_api_key = pinecone_key
         
         st.markdown("---")
         
@@ -951,69 +927,6 @@ def main():
                 st.caption("AI will use knowledge base and Google Search.")
             else:
                 st.caption("No documents added. AI will use knowledge base and Google Search.")
-        
-        # Pinecone Cloud Storage Section
-        st.markdown("---")
-        st.markdown('<div class="sidebar-section">☁️ Pinecone Cloud Storage</div>', unsafe_allow_html=True)
-        
-        pinecone_key = st.session_state.pinecone_api_key
-        gemini_key = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
-        resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
-        
-        if PINECONE_AVAILABLE and pinecone_key:
-            # Initialize Pinecone if not already done
-            pinecone_service = get_pinecone_rag()
-            if pinecone_service is None and gemini_key:
-                pinecone_service = initialize_pinecone(pinecone_key, gemini_key)
-            
-            if pinecone_service:
-                try:
-                    stats = pinecone_service.get_stats()
-                    if stats.get('total_vectors', 0) > 0:
-                        st.success(f"☁️ {stats['total_vectors']} vectors in cloud")
-                        st.caption("Documents persist permanently in Pinecone!")
-                        st.session_state.pinecone_indexed = True
-                    else:
-                        st.info("Cloud index is empty. Index your documents below.")
-                except Exception as e:
-                    st.warning(f"Could not check Pinecone status: {e}")
-            
-            # Show indexing UI
-            if os.path.exists(resources_path):
-                if st.session_state.pinecone_indexing:
-                    st.info("⏳ Indexing to Pinecone Cloud... This may take a while.")
-                    with st.spinner("Uploading documents to Pinecone..."):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        def pinecone_progress(count, filename):
-                            progress_bar.progress(min(count / 500, 1.0))
-                            status_text.text(f"Processing: {filename[:35]}...")
-                        
-                        try:
-                            result = index_documents_to_pinecone(
-                                pinecone_key, 
-                                gemini_key, 
-                                resources_path, 
-                                pinecone_progress
-                            )
-                            st.session_state.pinecone_indexed = True
-                            st.session_state.pinecone_indexing = False
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Indexing error: {str(e)}")
-                            st.session_state.pinecone_indexing = False
-                else:
-                    if not st.session_state.pinecone_indexed:
-                        if st.button("☁️ Index to Pinecone Cloud", use_container_width=True,
-                                    help="Upload documents to Pinecone (persists forever, even on free tier!)"):
-                            st.session_state.pinecone_indexing = True
-                            st.rerun()
-        else:
-            if not pinecone_key:
-                st.caption("Enter Pinecone API key above to enable cloud storage.")
-            elif not PINECONE_AVAILABLE:
-                st.caption("Pinecone library not installed.")
         
         # Footer
         st.markdown("---")

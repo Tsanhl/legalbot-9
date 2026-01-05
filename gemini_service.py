@@ -28,17 +28,6 @@ except ImportError:
     RAG_AVAILABLE = False
     print("⚠️ RAG service not available. Document content retrieval disabled.")
 
-# Pinecone Service for cloud-based vector storage (persistent)
-try:
-    from pinecone_service import get_pinecone_service, get_pinecone_context, PineconeRAGService
-    PINECONE_AVAILABLE = True
-except ImportError:
-    PINECONE_AVAILABLE = False
-    print("⚠️ Pinecone service not available.")
-
-# Global Pinecone instance
-_pinecone_rag: Any = None
-
 MODEL_NAME = 'gemini-2.5-pro'
 
 # Store chat sessions by project ID
@@ -912,35 +901,9 @@ def initialize_knowledge_base():
         return True
     return False
 
-def initialize_pinecone(pinecone_api_key: str, gemini_api_key: str = None):
-    """Initialize the Pinecone service for cloud vector storage"""
-    global _pinecone_rag
-    
-    if PINECONE_AVAILABLE and pinecone_api_key:
-        try:
-            _pinecone_rag = get_pinecone_service(pinecone_api_key, gemini_api_key)
-            return _pinecone_rag
-        except Exception as e:
-            print(f"Could not initialize Pinecone: {e}")
-    return None
 
-def get_pinecone_rag():
-    """Get the Pinecone RAG service instance"""
-    return _pinecone_rag
+    
 
-def index_documents_to_pinecone(pinecone_api_key: str, gemini_api_key: str, resources_path: str, progress_callback=None):
-    """Index documents to Pinecone cloud vector database"""
-    global _pinecone_rag
-    
-    if not PINECONE_AVAILABLE:
-        return {'error': 'Pinecone not available'}
-    
-    if _pinecone_rag is None:
-        _pinecone_rag = get_pinecone_service(pinecone_api_key, gemini_api_key)
-    
-    if _pinecone_rag:
-        return _pinecone_rag.index_documents(resources_path, progress_callback)
-    return {'error': 'Could not initialize Pinecone'}
 
 def get_or_create_chat(api_key: str, project_id: str, documents: List[Dict] = None, history: List[Dict] = None) -> Any:
     """Get or create a chat session for a project"""
@@ -1016,16 +979,8 @@ def send_message_with_docs(
     # Build content parts
     parts = []
     
-    # Pinecone: Retrieve relevant content from cloud vector database (priority)
-    if PINECONE_AVAILABLE and _pinecone_rag:
-        try:
-            pinecone_context = _pinecone_rag.get_context_for_query(message, max_chunks=6)
-            if pinecone_context:
-                parts.append(pinecone_context)
-        except Exception as e:
-            print(f"Pinecone retrieval warning: {e}")
-    # Fallback to local RAG if Pinecone not available
-    elif RAG_AVAILABLE:
+    # RAG: Retrieve relevant content from local vector database
+    if RAG_AVAILABLE:
         try:
             rag_context = get_relevant_context(message, max_chunks=6)
             if rag_context:
