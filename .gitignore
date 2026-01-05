@@ -3,5 +3,3 @@ node_modules/
 __pycache__/
 *.pyc
 .streamlit/
-law-resources-index.json
-chroma_db/
