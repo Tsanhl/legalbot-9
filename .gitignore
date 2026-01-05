@@ -3,5 +3,6 @@ node_modules/
 __pycache__/
 *.pyc
 .streamlit/
-law-resources-index.json
+.gemini_files_cache.json
 chroma_db/
+law-resources-index.json

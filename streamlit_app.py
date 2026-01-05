@@ -17,7 +17,11 @@ from gemini_service import (
     initialize_knowledge_base, 
     send_message_with_docs, 
     reset_session,
-    encode_file_to_base64
+    encode_file_to_base64,
+    initialize_gemini_files,
+    upload_documents_to_gemini,
+    get_gemini_files,
+    FILES_API_AVAILABLE
 )
 
 # RAG Service for document content retrieval
@@ -578,6 +582,12 @@ def init_session_state():
     
     if 'pending_edit_prompt' not in st.session_state:
         st.session_state.pending_edit_prompt = None
+    
+    if 'gemini_files_uploading' not in st.session_state:
+        st.session_state.gemini_files_uploading = False
+    
+    if 'gemini_files_count' not in st.session_state:
+        st.session_state.gemini_files_count = 0
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -927,6 +937,51 @@ def main():
                 st.caption("AI will use knowledge base and Google Search.")
             else:
                 st.caption("No documents added. AI will use knowledge base and Google Search.")
+        
+        # Gemini Cloud Upload Section (Alternative to local RAG)
+        st.markdown("---")
+        st.markdown('<div class="sidebar-section">☁️ Cloud Document Storage</div>', unsafe_allow_html=True)
+        
+        api_key_for_upload = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
+        resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
+        
+        if FILES_API_AVAILABLE and api_key_for_upload:
+            # Check if we have uploaded files
+            files_service = get_gemini_files()
+            if files_service:
+                uploaded = files_service.get_uploaded_files()
+                if uploaded:
+                    st.success(f"☁️ {len(uploaded)} documents in Gemini Cloud")
+                    st.caption("Documents persist for 48 hours in Google's cloud.")
+            
+            # Show upload button if documents exist
+            if os.path.exists(resources_path):
+                if st.session_state.gemini_files_uploading:
+                    st.info("⏳ Uploading to Gemini Cloud... Please wait.")
+                    with st.spinner("Uploading documents to Google's cloud storage..."):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        def upload_progress(current, total, filename, status):
+                            progress_bar.progress(current / total if total > 0 else 0)
+                            status_text.text(f"{status}: {filename[:30]}...")
+                        
+                        try:
+                            result = upload_documents_to_gemini(api_key_for_upload, resources_path, upload_progress)
+                            st.session_state.gemini_files_count = result.get('uploaded', 0) + result.get('cached', 0)
+                            st.session_state.gemini_files_uploading = False
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Upload error: {str(e)}")
+                            st.session_state.gemini_files_uploading = False
+                else:
+                    if st.button("☁️ Upload to Gemini Cloud", use_container_width=True, 
+                                help="Upload documents to Google's cloud (persists 48 hours, no local indexing needed)"):
+                        st.session_state.gemini_files_uploading = True
+                        initialize_gemini_files(api_key_for_upload)
+                        st.rerun()
+        else:
+            st.caption("Enter API key to enable cloud upload.")
         
         # Footer
         st.markdown("---")
