@@ -39,6 +39,45 @@ sanitize_output_against_allowlist = getattr(
 )
 strip_internal_reasoning = getattr(_gs, "strip_internal_reasoning", lambda text: text or "")
 
+
+def _normalize_send_message_result(result: Any) -> tuple[Any, str]:
+    """
+    Normalize gemini_service.send_message_with_docs return shape.
+    Expected shape is (payload, rag_context), but some builds may drift.
+    """
+    payload: Any = result
+    rag_context = ""
+    if isinstance(result, tuple):
+        if len(result) >= 1:
+            payload = result[0]
+        if len(result) >= 2 and isinstance(result[1], str):
+            rag_context = result[1]
+    return payload, rag_context
+
+
+def _extract_text_from_payload(payload: Any) -> str:
+    """Extract text from non-stream payloads robustly."""
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, (tuple, list)) and payload:
+        first = payload[0]
+        if isinstance(first, str):
+            return first
+        txt = getattr(first, "text", None)
+        if isinstance(txt, str):
+            return txt
+    txt = getattr(payload, "text", None)
+    if isinstance(txt, str):
+        return txt
+    return ""
+
+
+def _call_send_message_with_docs_safe(*args, **kwargs) -> tuple[Any, str]:
+    """Call send_message_with_docs with return-shape normalization."""
+    return _normalize_send_message_result(send_message_with_docs(*args, **kwargs))
+
 # RAG Service for document content retrieval
 try:
     from rag_service import get_rag_service, RAGService
@@ -2194,7 +2233,7 @@ def main():
                     # Use streaming for faster response  
                     # Pass history to enable conversation memory
                     # NOTE: Retrieval happens inside send_message_with_docs; we surface a status line above.
-                    stream, rag_context = send_message_with_docs(
+                    stream, rag_context = _call_send_message_with_docs_safe(
                         api_key,
                         prompt_for_model,
                         current_project.get('documents', []),
@@ -2436,7 +2475,7 @@ def main():
                                     "DRAFT ANSWER TO REWRITE:\n"
                                     f"{final_response}\n"
                                 )
-                                (rewrite_text, _), _ = send_message_with_docs(
+                                rewrite_payload, _ = _call_send_message_with_docs_safe(
                                     api_key,
                                     rewrite_prompt,
                                     current_project.get('documents', []),
@@ -2444,6 +2483,7 @@ def main():
                                     history=conversation_history,
                                     stream=False
                                 )
+                                rewrite_text = _extract_text_from_payload(rewrite_payload)
                                 if isinstance(rewrite_text, str) and rewrite_text.strip():
                                     final_response = rewrite_text
                             except Exception as fix_e:
@@ -2503,7 +2543,7 @@ def main():
                                         "CURRENT ANSWER:\n"
                                         f"{rewrite_candidate}\n"
                                     )
-                                    (rewrite_text, _), _ = send_message_with_docs(
+                                    rewrite_payload, _ = _call_send_message_with_docs_safe(
                                         api_key,
                                         rewrite_prompt,
                                         current_project.get('documents', []),
@@ -2511,6 +2551,7 @@ def main():
                                         history=conversation_history,
                                         stream=False
                                     )
+                                    rewrite_text = _extract_text_from_payload(rewrite_payload)
                                     if isinstance(rewrite_text, str) and rewrite_text.strip():
                                         rewrite_candidate = _restore_paragraph_separation(rewrite_text)
                                         rewrite_candidate, removed_curr = sanitize_output_against_allowlist(
@@ -2549,7 +2590,7 @@ def main():
                                         "DRAFT ANSWER TO REWRITE:\n"
                                         f"{final_response}\n"
                                     )
-                                    (rewrite_text, _), _ = send_message_with_docs(
+                                    rewrite_payload, _ = _call_send_message_with_docs_safe(
                                         api_key,
                                         rewrite_prompt,
                                         current_project.get('documents', []),
@@ -2557,6 +2598,7 @@ def main():
                                         history=conversation_history,
                                         stream=False
                                     )
+                                    rewrite_text = _extract_text_from_payload(rewrite_payload)
                                     if isinstance(rewrite_text, str) and rewrite_text.strip():
                                         final_response = _truncate_to_word_cap(rewrite_text, max_w, min_w)
                                 except Exception as concl_fix_e:
@@ -2598,7 +2640,7 @@ def main():
                                         "UNFINISHED ANSWER:\n"
                                         f"{final_response}\n"
                                     )
-                                    (patch_text, _), _ = send_message_with_docs(
+                                    patch_payload, _ = _call_send_message_with_docs_safe(
                                         api_key,
                                         completion_prompt,
                                         current_project.get('documents', []),
@@ -2606,6 +2648,7 @@ def main():
                                         history=conversation_history,
                                         stream=False
                                     )
+                                    patch_text = _extract_text_from_payload(patch_payload)
                                     if not (isinstance(patch_text, str) and patch_text.strip()):
                                         break
                                     patch_clean = _strip_generation_artifacts(patch_text)
@@ -2708,7 +2751,7 @@ def main():
                                     "DRAFT ANSWER:\n"
                                     f"{final_response}\n"
                                 )
-                                (rewrite_text, _), _ = send_message_with_docs(
+                                rewrite_payload, _ = _call_send_message_with_docs_safe(
                                     api_key,
                                     rewrite_prompt,
                                     current_project.get('documents', []),
@@ -2716,6 +2759,7 @@ def main():
                                     history=conversation_history,
                                     stream=False
                                 )
+                                rewrite_text = _extract_text_from_payload(rewrite_payload)
                                 if isinstance(rewrite_text, str) and rewrite_text.strip():
                                     final_response = strip_internal_reasoning(rewrite_text)
                                     final_response = _strip_generation_artifacts(final_response)
