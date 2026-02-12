@@ -3,3 +3,7 @@ node_modules/
 __pycache__/
 *.pyc
 .streamlit/
+chroma_db/
+Law resouces  copy 2/
+*.pkl
+*.sqlite3

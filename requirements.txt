@@ -8,3 +8,5 @@ watchdog
 PyMuPDF
 python-docx
 chromadb
+numpy
+huggingface_hub
