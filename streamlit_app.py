@@ -15,21 +15,29 @@ import uuid
 
 # Import services
 from knowledge_base import load_law_resource_index, get_knowledge_base_summary
-from gemini_service import (
-    initialize_knowledge_base,
-    send_message_with_docs,
-    reset_session,
-    encode_file_to_base64,
-    get_allowed_authorities_from_rag,
-    sanitize_output_against_allowlist,
-    strip_internal_reasoning,
+import gemini_service as _gs
+
+
+def _missing_send_message_with_docs(*_args, **_kwargs):
+    raise RuntimeError("send_message_with_docs is missing from gemini_service")
+
+
+initialize_knowledge_base = getattr(_gs, "initialize_knowledge_base", lambda: None)
+send_message_with_docs = getattr(_gs, "send_message_with_docs", _missing_send_message_with_docs)
+reset_session = getattr(_gs, "reset_session", lambda _project_id: None)
+encode_file_to_base64 = getattr(
+    _gs,
+    "encode_file_to_base64",
+    lambda file_content: base64.b64encode(file_content).decode("utf-8"),
 )
-try:
-    from gemini_service import detect_long_essay
-except Exception:
-    # Backward-compat fallback for deployments where detect_long_essay is absent.
-    def detect_long_essay(_message: str) -> dict:
-        return {"is_long_essay": False}
+detect_long_essay = getattr(_gs, "detect_long_essay", lambda _message: {"is_long_essay": False})
+get_allowed_authorities_from_rag = getattr(_gs, "get_allowed_authorities_from_rag", lambda _ctx, limit=180: [])
+sanitize_output_against_allowlist = getattr(
+    _gs,
+    "sanitize_output_against_allowlist",
+    lambda text, _allowlist, rag_context_len=0, strict=True: (text or "", []),
+)
+strip_internal_reasoning = getattr(_gs, "strip_internal_reasoning", lambda text: text or "")
 
 # RAG Service for document content retrieval
 try:
