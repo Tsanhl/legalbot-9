@@ -16,15 +16,20 @@ import uuid
 # Import services
 from knowledge_base import load_law_resource_index, get_knowledge_base_summary
 from gemini_service import (
-    initialize_knowledge_base, 
-    send_message_with_docs, 
+    initialize_knowledge_base,
+    send_message_with_docs,
     reset_session,
     encode_file_to_base64,
-    detect_long_essay,
     get_allowed_authorities_from_rag,
     sanitize_output_against_allowlist,
-    strip_internal_reasoning
+    strip_internal_reasoning,
 )
+try:
+    from gemini_service import detect_long_essay
+except Exception:
+    # Backward-compat fallback for deployments where detect_long_essay is absent.
+    def detect_long_essay(_message: str) -> dict:
+        return {"is_long_essay": False}
 
 # RAG Service for document content retrieval
 try:
