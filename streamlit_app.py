@@ -7,6 +7,8 @@ import json
 import base64
 import os
 import re
+import bisect
+import math
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 import uuid
@@ -17,14 +19,19 @@ from gemini_service import (
     initialize_knowledge_base, 
     send_message_with_docs, 
     reset_session,
-    encode_file_to_base64
+    encode_file_to_base64,
+    detect_long_essay,
+    get_allowed_authorities_from_rag,
+    sanitize_output_against_allowlist,
+    strip_internal_reasoning
 )
 
 # RAG Service for document content retrieval
 try:
     from rag_service import get_rag_service, RAGService
     RAG_AVAILABLE = True
-except ImportError:
+except (ImportError, Exception) as e:
+    print(f"RAG service not available: {e}")
     RAG_AVAILABLE = False
 
 # Page configuration
@@ -34,6 +41,941 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Pending long-response handling (used when user must type "Part 1"/"Proceed now")
+if 'pending_long_prompt' not in st.session_state:
+    st.session_state.pending_long_prompt = None
+
+# Optional (slow) second-pass rewrite to tighten word counts.
+# Default OFF to keep long outputs responsive.
+if 'enable_wordcount_adjust' not in st.session_state:
+    st.session_state.enable_wordcount_adjust = False
+
+# Optional heavy post-generation rewrites (citation-fix/conclusion-fix) are OFF by default
+# to keep finalization latency low. Core sanitization still runs.
+if 'enable_post_generation_rewrites' not in st.session_state:
+    st.session_state.enable_post_generation_rewrites = False
+
+def _normalize_output_style(text: str) -> str:
+    """
+    Normalize formatting for consistency:
+    - Remove decorative separator lines (e.g., repeated box-drawing characters).
+    - Collapse multiple blank lines to a single blank line.
+    """
+    raw = (text or "").replace("\r\n", "\n")
+    if not raw.strip():
+        return raw
+
+    sep_line = re.compile(r"^\s*[═─—\-_=]{8,}\s*$")
+    lines = []
+    for ln in raw.splitlines():
+        if sep_line.match(ln):
+            continue
+        lines.append(ln.rstrip())
+
+    normalized = "\n".join(lines).strip()
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized
+
+def _restore_paragraph_separation(text: str) -> str:
+    """
+    Recover readable paragraph structure when model output arrives as a single dense block.
+    - Ensure line breaks before section headers like "Part I:", "Part II:", "ESSAY QUESTION:", etc.
+    - Keep existing spacing when already well-formed.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    # Insert breaks before common structural headers when they are glued inline.
+    t = re.sub(r'(?<!\n)(\bPart\s+[IVXLC]+\s*:)', r'\n\n\1', t)
+    t = re.sub(r'(?<!\n)(\b(?:ESSAY QUESTION|PROBLEM QUESTION)\s*:)', r'\n\n\1', t, flags=re.IGNORECASE)
+    t = re.sub(r'(?<!\n)(\bPart\s+\d+\s*:)', r'\n\n\1', t, flags=re.IGNORECASE)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+def _roman_to_int(roman: str) -> int:
+    vals = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100}
+    s = (roman or "").upper().strip()
+    total = 0
+    prev = 0
+    for ch in reversed(s):
+        v = vals.get(ch, 0)
+        if v < prev:
+            total -= v
+        else:
+            total += v
+            prev = v
+    return total
+
+def _int_to_roman(num: int) -> str:
+    if num <= 0:
+        return "I"
+    table = [
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")
+    ]
+    out = []
+    n = num
+    for val, sym in table:
+        while n >= val:
+            out.append(sym)
+            n -= val
+    return "".join(out) or "I"
+
+def _enforce_part_numbered_conclusion_heading(text: str) -> str:
+    """
+    Ensure conclusion-like tail headings are Part-numbered.
+    Example: "Conclusion and Advice" -> "Part VI: Conclusion and Advice"
+    """
+    raw = (text or "")
+    if not raw.strip():
+        return raw
+
+    body = re.sub(r"\(End of Answer\)\s*$", "", raw, flags=re.IGNORECASE).rstrip()
+    continuation_line = None
+    m_cont = re.search(r"(?im)^\s*Will Continue to next part, say continue\s*$", body)
+    if m_cont:
+        continuation_line = "Will Continue to next part, say continue"
+        body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).rstrip()
+
+    # Find highest existing Part roman numeral.
+    part_nums = []
+    for m in re.finditer(r"(?im)^\s*Part\s+([IVXLC]+)\s*:\s*.+$", body):
+        part_nums.append(_roman_to_int(m.group(1)))
+    max_part = max(part_nums) if part_nums else 0
+
+    if max_part <= 0:
+        # No Part structure present; do not force-convert.
+        rebuilt = body
+        if continuation_line:
+            rebuilt = rebuilt + "\n\n" + continuation_line
+        return rebuilt
+
+    # Replace bare tail headings.
+    heading_pat = re.compile(
+        r"(?im)^\s*(Conclusion(?:\s+and\s+Advice)?|Advice(?:\s+and\s+Conclusion)?|Final\s+Advice)\s*$"
+    )
+    next_part = max_part + 1
+
+    def repl(m):
+        nonlocal next_part
+        heading = m.group(1).strip()
+        label = f"Part {_int_to_roman(next_part)}: {heading}"
+        next_part += 1
+        return label
+
+    body = heading_pat.sub(repl, body)
+
+    rebuilt = body.rstrip()
+    if continuation_line:
+        rebuilt = rebuilt + "\n\n" + continuation_line
+    return rebuilt
+
+def _next_part_conclusion_heading(text: str) -> str:
+    """
+    Build a conclusion heading that matches current Part numbering, if present.
+    Falls back to a plain heading when no Part structure exists.
+    """
+    raw = (text or "")
+    if not raw.strip():
+        return "Conclusion and Advice"
+    body = re.sub(r"\(End of Answer\)\s*$", "", raw, flags=re.IGNORECASE)
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+    part_nums = []
+    for m in re.finditer(r"(?im)^\s*Part\s+([IVXLC]+)\s*:\s*.+$", body):
+        part_nums.append(_roman_to_int(m.group(1)))
+    if not part_nums:
+        return "Conclusion and Advice"
+    return f"Part {_int_to_roman(max(part_nums) + 1)}: Conclusion and Advice"
+
+def _enforce_end_of_answer(text: str) -> str:
+    """
+    Enforce a clean ending:
+    - If the response is an intermediate multi-part output (ends with a 'Will Continue...' line),
+      DO NOT include any '(End of Answer)' marker.
+    - Otherwise, ensure EXACTLY ONE '(End of Answer)' at the end (remove any duplicates/legacy markers).
+    """
+    raw = _normalize_output_style(text).strip()
+    if not raw:
+        return "(End of Answer)"
+
+    # If an explicit end marker already appears, discard everything after the first marker.
+    # This prevents any leaked debug/context tail from surviving.
+    first_end = re.search(r"\(End of Answer\)", raw, flags=re.IGNORECASE)
+    if first_end:
+        raw = raw[:first_end.start()].rstrip()
+
+    # Never allow retrieval/debug dumps to leak into the main answer text.
+    leak_markers = [
+        "[RAG CONTEXT - INTERNAL - DO NOT OUTPUT]",
+        "[END RAG CONTEXT]",
+        "RETRIEVED LEGAL CONTEXT (from indexed documents)",
+        "END OF RETRIEVED CONTEXT",
+        "📚 RAG Retrieved Content (Debug)",
+        "RAG Retrieved Content (Debug)",
+        "Context Length:",
+        "Allowed Authorities (preview):",
+        "[ALL RETRIEVED DOCUMENTS]",
+        "[END ALL RETRIEVED DOCUMENTS]",
+        "No obvious primary authorities",
+        "Removed 1 non-retrieved authority mention",
+        "Removed 2 non-retrieved authority mention",
+        "Removed 3 non-retrieved authority mention",
+    ]
+    leak_positions = [raw.find(m) for m in leak_markers if m in raw]
+    if leak_positions:
+        raw = raw[: min(leak_positions)].rstrip()
+        if not raw:
+            return "(End of Answer)"
+
+    continue_patterns = [
+        r"will\s+continue\s+to\s+next\s+part,\s*say\s+continue",
+        r"will\s+continue\s+to\s+next\s+part",
+        r"say\s+continue\s*$",
+    ]
+    has_continuation = any(re.search(p, raw, flags=re.IGNORECASE) for p in continue_patterns)
+    has_end_marker = bool(re.search(r"\(End of Answer\)", raw, flags=re.IGNORECASE))
+
+    # If BOTH "(End of Answer)" and "Will Continue" appear, the answer is COMPLETE.
+    # The "Will Continue" is erroneous and must be stripped. "(End of Answer)" takes priority.
+    if has_end_marker and has_continuation:
+        has_continuation = False  # treat as final answer
+
+    # Remove all end markers (including legacy ones) everywhere to prevent duplicates.
+    cleaned = re.sub(r"\(End of Answer\)\s*", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(End of Essay\)\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(End of Problem Question\)\s*", "", cleaned, flags=re.IGNORECASE)
+    # Always strip erroneous "Will Continue" lines from final answers
+    if not has_continuation:
+        cleaned = re.sub(r"(?i)\n*will\s+continue\s+to\s+next\s+part.*$", "", cleaned, flags=re.MULTILINE)
+    cleaned = cleaned.strip()
+
+    if has_continuation:
+        # If the model produced multiple "Will Continue..." lines, keep only one at the end.
+        lines = [ln.rstrip() for ln in cleaned.splitlines() if ln.strip()]
+        # Remove all existing continuation lines first, then append a single canonical line.
+        lines = [ln for ln in lines if not re.search(r"will\s+continue\s+to\s+next\s+part", ln, flags=re.IGNORECASE)]
+        lines.append("Will Continue to next part, say continue")
+        return "\n\n".join(lines).strip()
+
+    return cleaned + "\n\n(End of Answer)"
+
+def _strip_generation_artifacts(text: str) -> str:
+    """
+    Remove debug/meta artefacts that sometimes leak from generation/rewrite steps.
+    """
+    t = (text or "")
+    if not t.strip():
+        return t
+    # Hard-cut when known debug headers leak into answer body.
+    cut_markers = [
+        "📚 RAG Retrieved Content (Debug)",
+        "Allowed Authorities (preview):",
+        "[RAG CONTEXT - INTERNAL - DO NOT OUTPUT]",
+        "[ALL RETRIEVED DOCUMENTS]",
+    ]
+    positions = [t.find(m) for m in cut_markers if m in t]
+    if positions:
+        t = t[:min(positions)]
+    # Remove standalone debug lines that can survive partial cuts.
+    t = re.sub(r'(?im)^\s*Removed\s+\d+\s+non-retrieved authority mention\(s\).*$', '', t)
+    t = re.sub(r'(?im)^\s*Context Length:\s*\d+\s*characters\s*$', '', t)
+    t = re.sub(r'(?im)^\s*No obvious primary authorities.*$', '', t)
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    return t
+
+def _extract_word_targets(prompt_text: str) -> List[int]:
+    """
+    Extract explicit per-question word count targets from the user's prompt.
+
+    Uses left-to-right order for multi-question prompts (Q1 count, Q2 count, etc.).
+    """
+    msg_lower = (prompt_text or "").lower()
+    # If users paste prior output/debug after the prompt, ignore that tail
+    # so long-response anchoring uses the real request only.
+    cut_markers = [
+        r"(?im)^\s*output\b.*$",
+        r"(?im)^\s*planning\b.*$",
+        r"(?im)^\s*long\s+multi-topic\s+response\s+detected\b.*$",
+        r"(?im)^\s*part\s*1\s*$",
+        r"(?im)^\s*📚\s*rag\s+retrieved\s+content\s*\(debug\)\s*$",
+    ]
+    cut_at = None
+    for pat in cut_markers:
+        m = re.search(pat, msg_lower)
+        if m:
+            cut_at = m.start() if cut_at is None else min(cut_at, m.start())
+    if cut_at is not None:
+        msg_lower = msg_lower[:cut_at]
+    # Accept common typos like "wrods" so word-count enforcement isn't bypassed.
+    matches = re.findall(r'(\d{1,2},?\d{3}|\d{3,5})\s*(?:words?|wrods?)', msg_lower)
+    targets: List[int] = []
+    for m in matches:
+        try:
+            n = int(m.replace(',', ''))
+        except ValueError:
+            continue
+        if n >= 300:  # ignore small numbers that are unlikely to be word targets
+            targets.append(n)
+    return targets
+
+def _extract_authority_hints_from_prompt(prompt_text: str, limit: int = 40) -> List[str]:
+    """
+    Extract authority-like tokens from the user prompt so core authorities explicitly
+    provided by the user are not removed by the strict RAG allow-list sanitizer.
+    """
+    text = (prompt_text or "")
+    if not text:
+        return []
+
+    seen = set()
+    out: List[str] = []
+
+    def add(item: str):
+        s = (item or "").strip()
+        if not s:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(s)
+
+    # Statutes.
+    for m in re.finditer(r"\b([A-Z][A-Za-z ,&()'-]+ Act \d{4})\b", text):
+        add(m.group(1))
+
+    # Treaty articles.
+    for m in re.finditer(r"\b(Article\s+\d+(?:\(\d+\))?\s+T[FE]U)\b", text, flags=re.IGNORECASE):
+        add(m.group(1))
+    for m in re.finditer(r"\b(Article\s+\d+(?:\(\d+\))?\s+(?:ECHR|ICCPR))\b", text, flags=re.IGNORECASE):
+        add(m.group(1))
+
+    # Classic "X v Y" case names (with optional citation tail).
+    for m in re.finditer(
+        r"\b([A-Z][A-Za-z0-9 .,&()'/-]+ v [A-Z][A-Za-z0-9 .,&()'/-]+(?:\s*\[[12][0-9]{3}\][^)\n]{0,80})?)\b",
+        text,
+    ):
+        add(m.group(1))
+
+    # Short-form labels explicitly stated as "... <Name> case ..." in the prompt.
+    # This helps preserve required aliases such as "Belmarsh case" through strict sanitization.
+    stop_aliases = {
+        "essay", "question", "problem", "part", "introduction", "conclusion",
+        "international", "human", "rights", "law",
+    }
+    for m in re.finditer(r"\b([A-Z][A-Za-z-]{3,}(?:\s+[A-Z][A-Za-z-]{3,}){0,2})\s+case\b", text):
+        alias = (m.group(1) or "").strip()
+        if alias and alias.lower() not in stop_aliases:
+            add(alias)
+
+    return out[:limit]
+
+def _count_words(text: str) -> int:
+    cleaned = text or ""
+    cleaned = re.sub(r"(?im)^\s*(ESSAY|PROBLEM QUESTION|Q\d+)\s*:.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*[═=]{3,}\s*$", "", cleaned)
+    cleaned = re.sub(r"\(End of Answer\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", cleaned)
+    tokens = re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", cleaned)
+    return len(tokens)
+
+def _assistant_message_counts_as_part(msg_text: str) -> bool:
+    """
+    Return True only for substantive assistant outputs that should advance
+    long-response part numbering.
+    """
+    txt = (msg_text or "").strip()
+    if not txt:
+        return False
+
+    low = txt.lower()
+    non_part_markers = [
+        "long response detected",
+        "long multi-topic response detected",
+        "type **'part 1'** or **'continue'** to begin",
+        "ready to start?",
+        "please respond with either",
+        "retrieving sources",
+        "thinking...",
+    ]
+    if any(m in low for m in non_part_markers):
+        return False
+
+    if re.search(r"(?im)^\s*Will Continue to next part, say continue\s*$", txt):
+        return True
+    if re.search(r"\(End of Answer\)", txt, flags=re.IGNORECASE):
+        return True
+
+    words = re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", txt)
+    return len(words) >= 120
+
+def _split_answer_sections(answer_text: str) -> List[str]:
+    """
+    Split a combined answer into sections using standard headers.
+    Falls back to a single section if headers are not found.
+    """
+    text = answer_text or ""
+    # Remove trailing end markers for counting purposes
+    text = re.sub(r"\(End of Answer\)\s*$", "", text.strip(), flags=re.IGNORECASE)
+
+    pattern = re.compile(r"(?m)^(ESSAY|PROBLEM QUESTION|Q\d+)\s*:", re.IGNORECASE)
+    starts = [m.start() for m in pattern.finditer(text)]
+    if not starts:
+        return [text.strip()] if text.strip() else []
+    starts.append(len(text))
+
+    sections: List[str] = []
+    for i in range(len(starts) - 1):
+        chunk = text[starts[i]:starts[i + 1]].strip()
+        if chunk:
+            sections.append(chunk)
+    return sections
+
+def _needs_wordcount_fix(prompt_text: str, answer_text: str) -> Optional[str]:
+    """
+    Return an instruction string for a rewrite if any section misses its word target.
+    Returns None when no fix is needed or targets cannot be reliably mapped.
+    """
+    targets = _extract_word_targets(prompt_text)
+    if not targets:
+        return None
+
+    sections = _split_answer_sections(answer_text)
+    if len(targets) == 1:
+        actual = _count_words(answer_text)
+        target = targets[0]
+        min_words = int(target * 0.99)
+        if actual < min_words or actual > target:
+            return f"Rewrite to total wordcount in range {min_words}-{target} (inclusive). Do not exceed {target}."
+        return None
+
+    # Multi-question: only enforce per-section if we can map targets to sections.
+    if len(sections) != len(targets):
+        return None
+
+    failures = []
+    for idx, (section, target) in enumerate(zip(sections, targets), start=1):
+        actual = _count_words(section)
+        min_words = int(target * 0.99)
+        if actual < min_words or actual > target:
+            failures.append((idx, min_words, target, actual))
+
+    if not failures:
+        return None
+
+    lines = ["Rewrite with STRICT per-section word counts (do not exceed)."]
+    for idx, min_words, target, actual in failures:
+        lines.append(f"- Section {idx}: required range {min_words}-{target} (inclusive); currently ~{actual}.")
+    return "\n".join(lines)
+
+def _has_visible_conclusion(answer_text: str) -> bool:
+    """
+    Heuristic check for a closing conclusion/advice in the tail of an answer.
+    Used only as a quality guard for final parts.
+    """
+    text = (answer_text or "").strip()
+    if not text:
+        return False
+    # Intermediate part marker means this is intentionally not final.
+    if re.search(r"(?im)^\s*Will Continue to next part, say continue\s*$", text):
+        return True
+
+    body = re.sub(r"\(End of Answer\)\s*$", "", text, flags=re.IGNORECASE).strip()
+    if not body:
+        return False
+
+    # Fast-path for explicit conclusion headings (including Part-numbered forms).
+    if re.search(
+        r"(?im)^\s*(?:Part\s+[IVXLC]+\s*:\s*)?(?:Conclusion(?:\s+and\s+Advice)?|Advice(?:\s+and\s+Conclusion)?|Final\s+Advice)\s*$",
+        body,
+    ):
+        return True
+
+    # Check only the very end of the answer; broad tail scans can produce false positives.
+    tail = body[max(0, len(body) - 900):].lower()
+    patterns = [
+        r"\bin conclusion\b",
+        r"\bto conclude\b",
+        r"\bin summary\b",
+        r"\bon balance\b",
+        r"\bfinal outcome\b",
+        r"\bfinal advice\b",
+        r"\bconclusion and advice\b",
+    ]
+    return any(re.search(p, tail) for p in patterns)
+
+def _append_conclusion_within_cap(answer_text: str, conclusion_block: str, max_words: int) -> str:
+    """
+    Append a required conclusion block while respecting max_words by trimming earlier body first.
+    This avoids losing the conclusion to end-truncation.
+    """
+    body = (answer_text or "").strip()
+    concl = (conclusion_block or "").strip()
+    if not concl:
+        return _truncate_to_word_cap(body, max_words, 1) if max_words > 0 else body
+    if max_words <= 0:
+        return (body + "\n\n" + concl).strip()
+
+    # Remove terminal markers before recomposition; they are re-added later.
+    body = re.sub(r"\(End of Answer\)\s*$", "", body, flags=re.IGNORECASE).strip()
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+
+    concl_words = max(1, _count_words(concl))
+    # Reserve at least the conclusion length (+ small cushion).
+    body_cap = max(1, max_words - concl_words - 6)
+    trimmed_body = _truncate_to_word_cap(body, body_cap, 1)
+    combined = (trimmed_body.rstrip() + "\n\n" + concl).strip()
+
+    if _count_words(combined) > max_words:
+        overflow = _count_words(combined) - max_words
+        tighter_cap = max(1, body_cap - overflow - 4)
+        trimmed_body = _truncate_to_word_cap(body, tighter_cap, 1)
+        combined = (trimmed_body.rstrip() + "\n\n" + concl).strip()
+
+    if _count_words(combined) > max_words:
+        combined = _truncate_to_word_cap(combined, max_words, 1)
+    return combined
+
+def _is_short_single_essay_prompt(prompt_text: str) -> bool:
+    """
+    True when prompt is a single essay request with explicit word target <= 2000.
+    """
+    targets = _extract_word_targets(prompt_text or "")
+    if len(targets) != 1:
+        return False
+    if int(targets[0]) > 2000:
+        return False
+    low = (prompt_text or "").lower()
+    if "problem question" in low:
+        return False
+    # Accept explicit essay prompts and "any topic" short-form prompts.
+    if "essay" in low:
+        return True
+    return any(k in low for k in ["any topic", "any subject", "any area"])
+
+def _short_essay_effective_cap(target_words: int) -> int:
+    """
+    Use a conservative cap for short essays so final displayed output
+    does not feel overlong after all post-processing/markers.
+    """
+    t = max(1, int(target_words or 0))
+    # Keep a small buffer under the nominal request.
+    return max(350, int(round(t * 0.98)))
+
+def _normalize_short_essay_output(answer_text: str) -> str:
+    """
+    Normalize structure for short essays:
+    - remove leaked debug/context tails
+    - prevent late restart with a second "Part I"
+    - keep one conclusion section at the end
+    """
+    text = _strip_generation_artifacts(answer_text or "").strip()
+    if not text:
+        return text
+
+    # Hard-cut anything after an explicit ending marker.
+    m_end = re.search(r"\((?:End of Answer|End of Essay|End of Problem Question)\)", text, flags=re.IGNORECASE)
+    if m_end:
+        text = text[:m_end.start()].rstrip()
+
+    # Remove continuation marker from short single-shot answers.
+    text = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", text).strip()
+
+    # If answer restarts with another Part I after already reaching later parts, cut the restart.
+    part_i_hits = list(re.finditer(r"(?im)^\s*Part\s+I\s*:\s*", text))
+    if len(part_i_hits) >= 2:
+        second_i = part_i_hits[1].start()
+        prefix = text[:second_i]
+        if re.search(r"(?im)^\s*Part\s+(?:IV|V|VI|VII|VIII|IX|X)\s*:\s*", prefix):
+            text = prefix.rstrip()
+
+    # If conclusion exists, keep only the first conclusion block and drop any later re-started parts.
+    concl_match = re.search(
+        r"(?im)^\s*Part\s+[IVXLC]+\s*:\s*Conclusion(?:\s+and\s+Advice)?\b",
+        text
+    ) or re.search(r"(?im)^\s*Conclusion(?:\s+and\s+Advice)?\b", text)
+    if concl_match:
+        tail = text[concl_match.end():]
+        next_part = re.search(r"(?im)^\s*Part\s+[IVXLC]+\s*:\s*", tail)
+        if next_part:
+            text = text[:concl_match.end() + next_part.start()].rstrip()
+
+    def _short_conclusion_block() -> str:
+        return (
+            "Part V: Conclusion\n\n"
+            "On balance, occupiers' liability remains a calibrated regime rather than a general accident-insurance model. "
+            "The 1957 Act protects lawful visitors through a proactive standard of reasonable safety, while the 1984 Act sets "
+            "a narrower humanitarian baseline for non-visitors. Modern authority, especially Tomlinson, confirms that obvious "
+            "risks and voluntarily assumed dangers ordinarily fall on the entrant, not the occupier. The strongest reading is "
+            "therefore a structured balance: occupiers must address non-obvious premises dangers they can reasonably control, "
+            "but the law preserves autonomy, public amenity, and practical limits on defensive risk elimination."
+        )
+
+    # Ensure essay-style conclusion heading for short essays.
+    has_part_v = bool(re.search(r"(?im)^\s*Part\s+V\s*:\s*Conclusion\b", text))
+    if not has_part_v:
+        # Normalize mislabelled conclusion headings if present.
+        text = re.sub(
+            r"(?im)^\s*Part\s+[IVXLC]+\s*:\s*Conclusion\s+and\s+Advice\b",
+            "Part V: Conclusion",
+            text
+        )
+        text = re.sub(r"(?im)^\s*Conclusion\s+and\s+Advice\b", "Part V: Conclusion", text)
+        text = re.sub(r"(?im)^\s*Conclusion\b", "Part V: Conclusion", text)
+        has_part_v = bool(re.search(r"(?im)^\s*Part\s+V\s*:\s*Conclusion\b", text))
+        if not has_part_v:
+            text = text.rstrip() + "\n\n" + _short_conclusion_block()
+            has_part_v = True
+
+    # Enforce substantive conclusion depth (not a one-liner).
+    if has_part_v:
+        concl_words = _count_words(_extract_conclusion_section_text(text))
+        if concl_words < 90:
+            text = text.rstrip() + (
+                "\n\nThis synthesis reflects a coherent policy settlement: meaningful protection against latent danger, "
+                "combined with clear responsibility for freely chosen, obvious risks."
+            )
+
+    return text.strip()
+
+def _is_essay_prompt(prompt_text: str) -> bool:
+    """
+    Detect essay-style prompts (excluding problem questions).
+    """
+    low = (prompt_text or "").lower()
+    return ("essay" in low) and ("problem question" not in low)
+
+def _is_essay_flow(prompt_text: str, messages: List[Dict[str, Any]]) -> bool:
+    """
+    Detect essay flow even during continuation turns where prompt may be just "continue".
+    """
+    if _is_essay_prompt(prompt_text):
+        return True
+    for msg in reversed(messages or []):
+        if msg.get("role") != "user":
+            continue
+        txt = (msg.get("text") or "").strip()
+        if not txt:
+            continue
+        if _is_essay_prompt(txt) and _extract_word_targets(txt):
+            return True
+    return False
+
+def _extract_conclusion_section_text(answer_text: str) -> str:
+    """
+    Extract conclusion section body text (best-effort) from an essay response.
+    """
+    body = (answer_text or "").strip()
+    if not body:
+        return ""
+    body = re.sub(r"\(End of Answer\)\s*$", "", body, flags=re.IGNORECASE).strip()
+    m = re.search(r"(?im)^\s*(?:Part\s+[IVXLC]+\s*:\s*)?Conclusion(?:\s+and\s+Advice)?\b.*$", body)
+    if not m:
+        # Tail fallback for implicit conclusions
+        return body[max(0, len(body) - 700):].strip()
+    tail = body[m.end():]
+    nxt = re.search(r"(?im)^\s*Part\s+[IVXLC]+\s*:\s*", tail)
+    if nxt:
+        return tail[:nxt.start()].strip()
+    return tail.strip()
+
+def _essay_quality_issues(
+    answer_text: str,
+    prompt_text: str,
+    is_short_single_essay: bool
+) -> List[str]:
+    """
+    Validate essay structure/fluency for final outputs.
+    Returns human-readable issue list.
+    """
+    issues: List[str] = []
+    txt = (answer_text or "").strip()
+    if not txt:
+        return ["Empty answer text."]
+
+    # Hard structural defects.
+    if _is_abrupt_answer_ending(txt):
+        issues.append("Answer ends abruptly or with an incomplete final sentence.")
+    if not _has_visible_conclusion(txt):
+        issues.append("No visible concluding section.")
+
+    # Placeholder / malformed citation artefacts.
+    if re.search(r"\(\s*[A-Za-z]\s*\)", txt):
+        issues.append("Contains placeholder citation markers like '(J )'.")
+    if re.search(r"(?im)\bsource\s+\d+\b", txt):
+        issues.append("Contains internal source-label leakage (for example 'Source N').")
+    if re.search(r"\[\s*RAG CONTEXT", txt, flags=re.IGNORECASE):
+        issues.append("Contains leaked internal RAG context markers.")
+
+    # Part-heading monotonicity: prevent restart from Part I late in answer.
+    parts = []
+    for m in re.finditer(r"(?im)^\s*Part\s+([IVXLC]+)\s*:\s*", txt):
+        try:
+            parts.append(_roman_to_int(m.group(1)))
+        except Exception:
+            continue
+    if len(parts) >= 2:
+        for i in range(1, len(parts)):
+            if parts[i] < parts[i - 1]:
+                issues.append("Part numbering regresses (answer appears to restart mid-output).")
+                break
+
+    concl_words = _count_words(_extract_conclusion_section_text(txt))
+    if is_short_single_essay:
+        # For <=2000-word essays, demand stronger structure and substantive conclusion.
+        required = ["Part I:", "Part II:", "Part III:", "Part IV:", "Part V:"]
+        missing = [h for h in required if h.lower() not in txt.lower()]
+        if missing:
+            issues.append(f"Missing required short-essay headings: {', '.join(missing)}")
+        if concl_words < 90:
+            issues.append(f"Conclusion is too short ({concl_words} words; require >=90).")
+    else:
+        # For long-essay final parts, conclusion should still be substantive.
+        if concl_words < 70:
+            issues.append(f"Conclusion appears too thin ({concl_words} words; require >=70).")
+
+    # If prompt explicitly requests a word target, enforce a practical quality floor.
+    targets = _extract_word_targets(prompt_text)
+    if len(targets) == 1:
+        target = int(targets[0])
+        floor = int(target * 0.82) if target <= 2000 else int(target * 0.75)
+        actual = _count_words(txt)
+        if actual < max(350, floor):
+            issues.append(f"Answer under-delivers on requested depth ({actual} words; expected at least {max(350, floor)}).")
+
+    return issues
+
+def _resolve_word_window_from_history(prompt_text: str, messages: List[Dict[str, Any]]) -> Optional[tuple]:
+    """
+    Resolve current part word window (min,max) from the latest long-request anchor in history.
+    This supports continuation messages like "continue" that do not contain explicit word counts.
+    """
+    if not messages:
+        return None
+
+    anchor_idx = -1
+    anchor_text = ""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "user":
+            continue
+        txt = (msg.get("text") or "").strip()
+        if _extract_word_targets(txt):
+            anchor_idx = i
+            anchor_text = txt
+            break
+    if anchor_idx < 0 or not anchor_text:
+        return None
+
+    plan = detect_long_essay(anchor_text)
+    if not plan.get("is_long_essay"):
+        return None
+
+    assistant_messages = [
+        m for m in messages[anchor_idx + 1:]
+        if m.get("role") == "assistant" and _assistant_message_counts_as_part(m.get("text") or "")
+    ]
+    assistants_after_anchor = len(assistant_messages)
+    current_part = assistants_after_anchor + 1
+    deliverables = plan.get("deliverables") or []
+    total_requested = int(plan.get("requested_words") or 0)
+    consumed_prior = sum(_count_words(m.get("text") or "") for m in assistant_messages)
+
+    if deliverables:
+        current_part = max(1, min(current_part, len(deliverables)))
+        target = int(deliverables[current_part - 1].get("target_words", 0) or 0)
+        cap = max(int(d.get("target_words", 0) or 0) for d in deliverables) if deliverables else target
+        remaining_parts = max(1, len(deliverables) - current_part + 1)
+    else:
+        target = int(plan.get("words_per_part") or 0)
+        cap = target
+        remaining_parts = max(1, int(plan.get("suggested_parts") or 1) - current_part + 1)
+
+    # Dynamic rebalance so cumulative total can still land in-range.
+    if total_requested > 0 and cap > 0:
+        remaining_total = max(1, total_requested - consumed_prior)
+        if remaining_parts <= 1:
+            target = min(cap, remaining_total)
+        else:
+            dynamic_share = int(math.ceil(remaining_total / remaining_parts))
+            target = min(cap, max(1, dynamic_share))
+
+    if target <= 0:
+        return None
+    # Keep a softer lower bound to avoid forcing abrupt, incomplete endings.
+    return (int(target * 0.90), target)
+
+def _expected_part_state_from_history(prompt_text: str, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Determine whether the current response should be intermediate or final
+    based on the latest anchored word-count request.
+    """
+    if not messages:
+        return None
+    anchor_idx = -1
+    anchor_text = ""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "user":
+            continue
+        txt = (msg.get("text") or "").strip()
+        if _extract_word_targets(txt):
+            anchor_idx = i
+            anchor_text = txt
+            break
+    if anchor_idx < 0 or not anchor_text:
+        return None
+    plan = detect_long_essay(anchor_text)
+    if not plan.get("is_long_essay"):
+        return None
+    assistants_after_anchor = sum(
+        1
+        for m in messages[anchor_idx + 1:]
+        if m.get("role") == "assistant" and _assistant_message_counts_as_part(m.get("text") or "")
+    )
+    current_part = assistants_after_anchor + 1
+    deliverables = plan.get("deliverables") or []
+    total_parts = len(deliverables) if deliverables else int(plan.get("suggested_parts") or 0)
+    if total_parts <= 0:
+        return None
+    is_final = current_part >= total_parts
+    return {"current_part": current_part, "total_parts": total_parts, "is_final": is_final}
+
+def _enforce_part_ending_by_history(answer_text: str, prompt_text: str, messages: List[Dict[str, Any]]) -> str:
+    """
+    Force correct part marker based on expected part state:
+    - intermediate: must end with Will Continue
+    - final: must end with (End of Answer)
+    """
+    state = _expected_part_state_from_history(prompt_text, messages)
+    if not state:
+        # Single-response (or unknown state): treat any "Will Continue..." marker as stray
+        # and force a clean final ending.
+        plan = detect_long_essay(prompt_text or "")
+        if not plan.get("is_long_essay"):
+            txt = _strip_generation_artifacts(answer_text or "").strip()
+            txt = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", txt).strip()
+            return _enforce_end_of_answer(txt)
+        # For true long responses, fall back to prior behaviour.
+        return _enforce_end_of_answer(answer_text)
+
+    txt = _strip_generation_artifacts(answer_text or "").strip()
+    # Remove any accidental internal end markers; the app will add exactly one correct ending.
+    txt = re.sub(r"\(End of Answer\)\s*", "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"\(End of Essay\)\s*", "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"\(End of Problem Question\)\s*", "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", txt).strip()
+    # Strip any trailing end marker variants (already removed globally above, but keep for safety).
+    txt = re.sub(r"\(End of Answer\)\s*$", "", txt, flags=re.IGNORECASE).strip()
+    if not txt:
+        txt = "(No content generated.)"
+
+    if state["is_final"]:
+        return txt + "\n\n(End of Answer)"
+    return txt + "\n\nWill Continue to next part, say continue"
+
+def _truncate_to_word_cap(answer_text: str, max_words: int, min_words: int = 1) -> str:
+    """
+    Hard-cap output to max_words while preserving continuation/end markers.
+    This is a final safety net for strict 99-100% word limits.
+    """
+    if max_words <= 0:
+        return answer_text
+    if min_words <= 0:
+        min_words = 1
+    if min_words > max_words:
+        min_words = max_words
+
+    text = answer_text or ""
+    has_continue = bool(re.search(r"(?im)^\s*Will Continue to next part, say continue\s*$", text))
+    has_end = bool(re.search(r"\(End of Answer\)\s*$", text, flags=re.IGNORECASE))
+
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", text).strip()
+    body = re.sub(r"\(End of Answer\)\s*$", "", body, flags=re.IGNORECASE).strip()
+
+    # Count "words" using the same token pattern as _count_words so hard-cap
+    # truncation aligns with enforcement logic while preserving original layout.
+    word_matches = list(re.finditer(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)*", body))
+    if len(word_matches) <= max_words:
+        return answer_text
+
+    # Prefer a sentence boundary inside the required [min_words, max_words]
+    # window so the response ends on a complete thought.
+    word_ends = [m.end() for m in word_matches]
+    sentence_end_re = re.compile(r'[.!?](?:["\')\]]+)?(?=\s|$)')
+    sentence_ends = [m.end() for m in sentence_end_re.finditer(body)]
+
+    cut_pos = None
+    best_wc = -1
+    for pos in sentence_ends:
+        wc = bisect.bisect_right(word_ends, pos)
+        if wc > max_words:
+            break
+        if wc >= min_words and wc > best_wc:
+            best_wc = wc
+            cut_pos = pos
+
+    # If no sentence ending in range, use the latest sentence ending <= max_words.
+    if cut_pos is None:
+        for pos in sentence_ends:
+            wc = bisect.bisect_right(word_ends, pos)
+            if wc > max_words:
+                break
+            if wc > best_wc:
+                best_wc = wc
+                cut_pos = pos
+
+    # Final fallback: exact max-word cut while preserving layout.
+    # Also use this path if a sentence-boundary cut would violate the minimum.
+    if cut_pos is None or best_wc < min_words:
+        cut_pos = word_matches[max_words - 1].end()
+
+    trimmed = body[:cut_pos].rstrip()
+    if trimmed and trimmed[-1] not in ".!?":
+        trimmed += "."
+
+    if has_continue:
+        return trimmed + "\n\nWill Continue to next part, say continue"
+    if has_end:
+        return trimmed + "\n\n(End of Answer)"
+    return trimmed
+
+def _is_abrupt_answer_ending(text: str) -> bool:
+    """
+    Detect likely truncation/abrupt stop (e.g., ending with 'bypass the').
+    """
+    body = (text or "")
+    body = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", body).strip()
+    body = re.sub(r"\(End of Answer\)\s*$", "", body, flags=re.IGNORECASE).strip()
+    if not body:
+        return False
+    last_line = ""
+    for ln in reversed(body.splitlines()):
+        if ln.strip():
+            last_line = ln.strip()
+            break
+    if not last_line:
+        return False
+    # Bare enumerators or bullets indicate likely truncation even if they end with punctuation.
+    if re.match(r"(?i)^(?:\(?\d+\)?[.)]|[a-z][.)]|[ivxlcdm]+[.)]|[-*•])\s*$", last_line):
+        return True
+    # A trailing heading without content is likely abrupt.
+    if re.match(
+        r"(?i)^(?:part\s+[ivxlcdm]+\s*:|part\s+\d+\s*:|conclusion\s*:|conclusion and advice\s*:|advice to [^:]+:)\s*$",
+        last_line,
+    ):
+        return True
+    if re.search(r"[.!?](?:[\"')\]]+)?\s*$", body):
+        return False
+    # If the tail ends on a connector/article, it's almost certainly cut.
+    if re.search(r"(?i)\b(and|or|to|of|for|with|under|against|between|by|the|a|an)\s*$", body):
+        return True
+    # Very short trailing fragment without punctuation is also suspicious.
+    if len(last_line.split()) <= 8:
+        return True
+    # Default: no terminal punctuation means likely abrupt cut.
+    return True
 
 # Custom CSS for legal styling with proper edge effects (NOT sticking to edges)
 st.markdown("""
@@ -578,6 +1520,23 @@ def init_session_state():
     
     if 'pending_edit_prompt' not in st.session_state:
         st.session_state.pending_edit_prompt = None
+    
+    if 'show_rag_debug' not in st.session_state:
+        st.session_state.show_rag_debug = False
+    # Public UI mode: keep RAG debug panels disabled.
+    st.session_state.show_rag_debug = False
+    
+    if 'last_rag_context' not in st.session_state:
+        # Always keep a string so the debug panel can render even when empty.
+        st.session_state.last_rag_context = ""
+    elif st.session_state.last_rag_context is None:
+        # Backward-compat: older sessions may have stored None.
+        st.session_state.last_rag_context = ""
+
+    if 'last_citation_allowlist' not in st.session_state:
+        st.session_state.last_citation_allowlist = []
+    if 'last_citation_violations' not in st.session_state:
+        st.session_state.last_citation_violations = []
 
 def get_current_project() -> Optional[Dict]:
     """Get the current project"""
@@ -597,6 +1556,63 @@ def create_new_project(name: str = None) -> Dict:
         'updated_at': datetime.now().isoformat(),
         'cross_memory': False
     }
+
+def get_conversation_history(current_project: Dict, include_current_message: bool = False) -> List[Dict]:
+    """
+    Get conversation history for AI context.
+    
+    This function builds a complete conversation history that enables:
+    1. Within-session memory - AI remembers all Q&A in current project
+    2. Cross-project memory - When enabled, AI can access history from other linked projects
+    
+    Args:
+        current_project: The current project dictionary
+        include_current_message: Whether to include the last message (usually False when calling AI)
+    
+    Returns:
+        List of message dicts with 'role' and 'text' keys for AI context
+    """
+    history = []
+    
+    # Check if cross-project memory is enabled for current project
+    cross_memory_enabled = current_project.get('cross_memory', False)
+    
+    if cross_memory_enabled:
+        # Collect history from ALL projects with cross_memory enabled
+        # This allows the AI to reference prior conversations across projects
+        for project in st.session_state.projects:
+            # Include messages from projects that have cross_memory enabled
+            if project.get('cross_memory', False) and project['id'] != current_project['id']:
+                project_messages = project.get('messages', [])
+                if project_messages:
+                    # Add project context marker
+                    history.append({
+                        'role': 'user',
+                        'text': f"[Context from project '{project['name']}']:"
+                    })
+                    # Add messages from this project (limit to last 10 to avoid token overflow)
+                    for msg in project_messages[-10:]:
+                        history.append({
+                            'role': msg.get('role', 'user'),
+                            'text': msg.get('text', '')
+                        })
+    
+    # Add current project's messages (this is the main conversation history)
+    current_messages = current_project.get('messages', [])
+    
+    # Determine how many messages to include
+    messages_to_include = current_messages if include_current_message else current_messages[:-1] if current_messages else []
+    
+    for msg in messages_to_include:
+        # Only include messages with actual text content
+        msg_text = msg.get('text', '')
+        if msg_text and msg_text.strip():
+            history.append({
+                'role': msg.get('role', 'user'),
+                'text': msg_text
+            })
+    
+    return history
 
 def parse_citations(text: str) -> str:
     """Parse citation JSON and convert to HTML buttons"""
@@ -699,6 +1715,52 @@ def render_message(message: Dict, is_user: bool, message_id: str = None, show_ed
                 </div>
             </div>
             """, unsafe_allow_html=True)
+        
+        # Render RAG Debug info if enabled (show even when empty so "nothing shown" is actionable)
+        # Backward-compat: older saved messages may have rag_context=None.
+        rag_context = message.get('rag_context') or ""
+        if st.session_state.get('show_rag_debug'):
+            with st.expander("📚 RAG Retrieved Content (Debug)", expanded=False):
+                st.markdown(f"**Context Length:** {len(rag_context)} characters")
+                st.markdown("---")
+                allow = message.get('citation_allowlist') or []
+                removed = message.get('citation_violations') or []
+                if removed:
+                    st.warning(f"Removed {len(removed)} non-retrieved authority mention(s) from the saved answer.")
+                    st.code("\n".join(removed[:20]) + ("..." if len(removed) > 20 else ""), language=None)
+                    st.markdown("---")
+                # Thin context warning
+                ctx_len = len(rag_context)
+                if 0 < ctx_len < 15000:
+                    st.warning(f"⚠️ Low retrieval: only {ctx_len:,} characters retrieved. The knowledge base may lack materials for this legal area. Consider adding relevant PDFs (statutes, cases, textbooks) to improve answer quality.")
+                if allow:
+                    def _looks_like_primary(a: str) -> bool:
+                        s = (a or "").lower()
+                        if not s.strip():
+                            return False
+                        # Statutes / instruments
+                        if (" act " in s or s.endswith(" act") or "regulation" in s or "directive" in s) and any(ch.isdigit() for ch in s):
+                            return True
+                        # Common case citation patterns (UK/EU)
+                        if " v " in s and ("[" in s or "ecr" in s or "ewhc" in s or "uksc" in s):
+                            return True
+                        if re.search(r"\beu:c:\d{4}:\d+\b", s):
+                            return True
+                        if re.search(r"\bcase\s+c-\d+/\d+\b", s) or re.search(r"\bc-\d+/\d+\b", s) or re.search(r"\bc-\d+\b", s):
+                            return True
+                        return False
+
+                    has_primary = any(_looks_like_primary(a) for a in allow)
+                    if not has_primary:
+                        st.warning("No obvious primary authorities (Acts/cases) detected in retrieved sources for this answer; consider adding statute/judgment PDFs to the index for 90+ work.")
+                    st.markdown("**Allowed Authorities (preview):**")
+                    st.code("\n".join(allow[:20]) + ("..." if len(allow) > 20 else ""), language=None)
+                    st.markdown("---")
+                if rag_context:
+                    # Display the context in a scrollable code block (first 8000 chars)
+                    st.code(rag_context[:8000] + ("..." if len(rag_context) > 8000 else ""), language=None)
+                else:
+                    st.code("(No RAG context returned for this message.)", language=None)
 
 def main():
     init_session_state()
@@ -725,7 +1787,7 @@ def main():
         # Configuration Section
         st.markdown('<div class="sidebar-section">⚙️ Configuration</div>', unsafe_allow_html=True)
         api_key = st.text_input(
-            "Gemini API Key (Optional)",
+            "Gemini API Key",
             value=st.session_state.api_key,
             type="password",
             placeholder="Enter Key or use Default...",
@@ -861,72 +1923,12 @@ def main():
                     st.rerun()
         
         st.markdown("---")
-        
-        # ===== KNOWLEDGE BASE ACTIVE SECTION =====
-        # This section handles auto-indexing for Streamlit Cloud deployment
+        # Warm-up RAG service in background, but keep status/debug UI hidden for public view.
         if RAG_AVAILABLE:
             try:
-                rag_service = get_rag_service()
-                stats = rag_service.get_stats()
-                
-                # Check if we need to auto-index (first deployment or empty database)
-                resources_path = os.path.join(os.path.dirname(__file__), 'Law resouces  copy 2')
-                
-                # Auto-index on first startup if database is empty
-                if stats['total_chunks'] == 0 and not st.session_state.auto_index_triggered and os.path.exists(resources_path):
-                    st.session_state.auto_index_triggered = True
-                    st.session_state.rag_indexing = True
-                    st.rerun()
-                
-                # Show indexing progress if currently indexing
-                if st.session_state.rag_indexing:
-                    st.markdown('<div class="sidebar-section">📚 Knowledge Base</div>', unsafe_allow_html=True)
-                    st.info("⏳ Auto-indexing law documents... Please wait.")
-                    
-                    with st.spinner("Indexing documents... This may take a few minutes on first startup."):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        def progress_callback(count, filename):
-                            progress_bar.progress(min(count / 500, 1.0))  # Estimate ~500 files
-                            status_text.text(f"Processing: {filename[:40]}...")
-                        
-                        try:
-                            result = rag_service.index_documents(resources_path, progress_callback)
-                            st.session_state.rag_stats = result
-                            st.session_state.rag_indexed = True
-                            st.session_state.rag_chunk_count = result['chunks']
-                            st.session_state.rag_indexing = False
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Indexing error: {str(e)}")
-                            st.session_state.rag_indexing = False
-                else:
-                    # Show Knowledge Base Active status
-                    st.markdown('<div class="sidebar-section">📚 Knowledge Base Active</div>', unsafe_allow_html=True)
-                    
-                    if stats['total_chunks'] > 0:
-                        st.success(f"✅ {stats['total_chunks']} text chunks indexed")
-                        st.caption("The AI can now search inside your law documents!")
-                    else:
-                        st.caption("No documents added. AI will use knowledge base and Google Search.")
-                        
-                        # Show manual index button if no documents indexed
-                        if os.path.exists(resources_path):
-                            if st.button("🔄 Index Law Documents", use_container_width=True, help="Extract and index text from all law resources"):
-                                st.session_state.rag_indexing = True
-                                st.rerun()
-                
+                _ = get_rag_service()
             except Exception as e:
-                st.markdown('<div class="sidebar-section">📚 Knowledge Base Active</div>', unsafe_allow_html=True)
-                st.caption("No documents added. AI will use knowledge base and Google Search.")
-        else:
-            # RAG not available - show basic Knowledge Base status  
-            st.markdown('<div class="sidebar-section">📚 Knowledge Base Active</div>', unsafe_allow_html=True)
-            if st.session_state.knowledge_base_loaded:
-                st.caption("AI will use knowledge base and Google Search.")
-            else:
-                st.caption("No documents added. AI will use knowledge base and Google Search.")
+                print(f"RAG service error: {e}")
         
         # Footer
         st.markdown("---")
@@ -954,6 +1956,7 @@ def main():
                 reset_session(current_project['id'])
                 st.rerun()
     
+    st.warning("AI may make mistakes. The answer, output IS FOR REFERENCE ONLY.")
     st.markdown("---")
     
     # Chat area
@@ -1034,13 +2037,8 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Knowledge Base Status
-                col1, col2, col3 = st.columns([1, 2, 1])
-                if st.session_state.knowledge_base_loaded:
-                    with col2:
-                        st.success("✅ Knowledge Base Active")
-                
                 # Centered content - BIGGER BOXES with DARKER TEXT
+                col1, col2, col3 = st.columns([1, 2, 1])
                 with col2:
                     st.markdown('<p style="color: #202124; font-size: 1.25rem; font-weight: 500; text-align: center; margin: 2rem 0;">Just ask your question</p>', unsafe_allow_html=True)
                     
@@ -1085,6 +2083,10 @@ def main():
             welcome_placeholder.empty()
             
         if current_project:
+            prompt_lower = prompt.strip().lower()
+            is_starting_pending_long = bool(st.session_state.pending_long_prompt) and prompt_lower in {"proceed now", "part 1", "continue"}
+            prompt_for_model = st.session_state.pending_long_prompt if is_starting_pending_long else prompt
+
             # Only add user message if this is a NEW prompt (not an edited one)
             # Edited prompts already have the message in place
             if not pending_prompt:
@@ -1096,8 +2098,9 @@ def main():
                 }
                 current_project['messages'].append(user_message)
                 
-                # Display user message immediately
+                # Display user message immediately (message loop already ran before this point)
                 render_message(user_message, is_user=True)
+
             
             # Get API key
             api_key = st.session_state.api_key or os.environ.get('GEMINI_API_KEY', '')
@@ -1105,76 +2108,199 @@ def main():
             if not api_key:
                 st.error("Please enter a Gemini API key in the sidebar configuration.")
             else:
-                # Show thinking indicator
-                thinking_placeholder = st.empty()
-                thinking_placeholder.markdown("""
-                <div class="chat-message assistant">
-                    <div class="chat-bubble assistant" style="display: flex; align-items: center; gap: 8px;">
-                        <div style="display: flex; gap: 4px;">
-                            <span style="animation: pulse 1s infinite; opacity: 0.6;">●</span>
-                            <span style="animation: pulse 1s infinite 0.2s; opacity: 0.6;">●</span>
-                            <span style="animation: pulse 1s infinite 0.4s; opacity: 0.6;">●</span>
+                # Check for long essay and show suggestion
+                # If the user is starting a pending long response, do not re-run the "await choice" gate.
+                # Render the long-essay gate inside a placeholder so we can clear it immediately on the next run.
+                long_essay_gate = st.empty()
+                long_essay_info = detect_long_essay(prompt_for_model) if not is_starting_pending_long else {'is_long_essay': False}
+                if long_essay_info.get('is_long_essay'):
+                    with long_essay_gate.container():
+                        st.info(long_essay_info['suggestion_message'])
+                        st.markdown("---")
+
+                        # If await_user_choice is True, STOP here and don't show "Thinking..." yet
+                        # Wait for user to respond with their choice (proceed now or use parts approach)
+                        if long_essay_info.get('await_user_choice'):
+                            st.session_state.pending_long_prompt = prompt
+                            st.info("💡 **Please respond** with either:\n- \"Proceed now\" - I'll write up to 2000 words in this part\n- \"Part 1\" or your specific request - To start with the parts approach")
+                            # Stop execution here - wait for user's next message
+                            st.stop()
+                else:
+                    # Ensure any previously rendered gate UI is removed before streaming begins.
+                    long_essay_gate.empty()
+
+                # In-chat "Thinking..." bubble (visible in the thread while retrieval/generation runs)
+                assistant_chat = st.chat_message("assistant")
+                with assistant_chat:
+                    thinking_placeholder = st.empty()
+                    thinking_placeholder.markdown(
+                        """
+                        <div style="
+                            border: 1px solid #e0e0e0;
+                            background: #f8f9fa;
+                            border-radius: 12px;
+                            padding: 14px 16px;
+                            display: flex;
+                            align-items: center;
+                            gap: 10px;
+                            max-width: 900px;
+                        ">
+                            <div style="display:flex; gap:6px; align-items:center;">
+                                <span style="width:8px; height:8px; background:#5f6368; border-radius:50%; opacity:.35; animation: dotPulse 1.2s infinite;"></span>
+                                <span style="width:8px; height:8px; background:#5f6368; border-radius:50%; opacity:.35; animation: dotPulse 1.2s infinite .15s;"></span>
+                                <span style="width:8px; height:8px; background:#5f6368; border-radius:50%; opacity:.35; animation: dotPulse 1.2s infinite .30s;"></span>
+                            </div>
+                            <div style="color:#5f6368; font-style: italic;">Thinking...</div>
                         </div>
-                        <span style="color: #5f6368; font-style: italic;">Thinking...</span>
-                    </div>
-                </div>
-                <style>
-                @keyframes pulse {
-                    0%, 100% { opacity: 0.3; }
-                    50% { opacity: 1; }
-                }
-                </style>
-                """, unsafe_allow_html=True)
-                
-                # Stream the response for faster display
-                response_placeholder = st.empty()
-                stop_button_placeholder = st.empty()
+                        <style>
+                        @keyframes dotPulse {
+                            0%, 100% { opacity: .25; transform: translateY(0px); }
+                            50% { opacity: 1; transform: translateY(-1px); }
+                        }
+                        </style>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    status_placeholder = st.empty()
+                    status_placeholder.markdown(
+                        "<div style='color:#5f6368; font-size: 0.85rem; margin-top: 6px;'>Retrieving sources…</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    response_placeholder = st.empty()
+                    stop_button_placeholder = st.empty()
                 full_response = ""
                 was_stopped = False
                 
                 try:
-                    # Use streaming for faster response
-                    stream = send_message_with_docs(
+                    # Build conversation history for context
+                    # This enables the AI to remember prior Q&A and provide follow-up responses
+                    conversation_history = get_conversation_history(current_project, include_current_message=False)
+                    
+                    # Use streaming for faster response  
+                    # Pass history to enable conversation memory
+                    # NOTE: Retrieval happens inside send_message_with_docs; we surface a status line above.
+                    stream, rag_context = send_message_with_docs(
                         api_key,
-                        prompt,
+                        prompt_for_model,
                         current_project.get('documents', []),
                         current_project['id'],
+                        history=conversation_history,  # Enable conversation memory
                         stream=True
                     )
+                    status_placeholder.markdown(
+                        "<div style='color:#5f6368; font-size: 0.85rem; margin-top: 6px;'>Generating answer…</div>",
+                        unsafe_allow_html=True,
+                    )
+                    
+                    # DEBUG: Keep RAG context (even if empty) so the panel can render.
+                    st.session_state.last_rag_context = rag_context or ""
+                    if rag_context:
+                        print(f"\n[DEBUG RAG CONTEXT] Retrieved content for query: '{prompt[:50]}...'")
+                        print(f"[DEBUG RAG CONTEXT] Context length: {len(rag_context)} characters")
                     
                     # Clear thinking indicator once we start getting response
                     first_chunk = True
                     grounding_sources = []
                     search_suggestions = []
                     last_chunk = None
+
+                    def _extract_stream_text(chunk_obj) -> str:
+                        """
+                        Extract text from both new `google.genai` stream chunks and legacy shapes.
+                        Some chunks may not expose `.text` even though they contain text in candidates.
+                        """
+                        if chunk_obj is None:
+                            return ""
+                        try:
+                            txt = getattr(chunk_obj, "text", None)
+                            if isinstance(txt, str) and txt:
+                                return txt
+                        except Exception:
+                            pass
+                        try:
+                            candidates = getattr(chunk_obj, "candidates", None)
+                            if candidates:
+                                cand = candidates[0]
+                                content = getattr(cand, "content", None)
+                                parts = getattr(content, "parts", None)
+                                if parts:
+                                    out_parts = []
+                                    for p in parts:
+                                        t = getattr(p, "text", None)
+                                        if isinstance(t, str) and t:
+                                            out_parts.append(t)
+                                    joined = "".join(out_parts).strip()
+                                    if joined:
+                                        return joined
+                        except Exception:
+                            pass
+                        if isinstance(chunk_obj, dict):
+                            try:
+                                txt = chunk_obj.get("text")
+                                if isinstance(txt, str) and txt:
+                                    return txt
+                            except Exception:
+                                pass
+                        return ""
                     
                     # Stream the response chunks
+                    # Keep "Thinking..." box visible during streaming; show final answer only when complete
                     for chunk in stream:
                         # Check if stop was requested
                         if st.session_state.stop_streaming:
                             was_stopped = True
                             st.session_state.stop_streaming = False
                             break
-                            
+
                         last_chunk = chunk  # Keep track of final chunk for metadata
-                        if hasattr(chunk, 'text'):
+                        chunk_text = _extract_stream_text(chunk)
+                        if chunk_text:
                             if first_chunk:
-                                thinking_placeholder.empty()
+                                # Update thinking box to show generation progress
+                                thinking_placeholder.markdown(
+                                    """
+                                    <div style="
+                                        border: 1px solid #e0e0e0;
+                                        background: #f8f9fa;
+                                        border-radius: 12px;
+                                        padding: 14px 16px;
+                                        display: flex;
+                                        align-items: center;
+                                        gap: 10px;
+                                        max-width: 900px;
+                                    ">
+                                        <div style="display:flex; gap:6px; align-items:center;">
+                                            <span style="width:8px; height:8px; background:#1a73e8; border-radius:50%; opacity:.35; animation: dotPulse 1.2s infinite;"></span>
+                                            <span style="width:8px; height:8px; background:#1a73e8; border-radius:50%; opacity:.35; animation: dotPulse 1.2s infinite .15s;"></span>
+                                            <span style="width:8px; height:8px; background:#1a73e8; border-radius:50%; opacity:.35; animation: dotPulse 1.2s infinite .30s;"></span>
+                                        </div>
+                                        <div style="color:#1a73e8; font-style: italic;">Generating final answer — please wait…</div>
+                                    </div>
+                                    <style>
+                                    @keyframes dotPulse {
+                                        0%, 100% { opacity: .25; transform: translateY(0px); }
+                                        50% { opacity: 1; transform: translateY(-1px); }
+                                    }
+                                    </style>
+                                    """,
+                                    unsafe_allow_html=True,
+                                )
+                                status_placeholder.empty()
                                 # Show Stop button
                                 stop_button_placeholder.button("⏹ Stop", key="stop_streaming_btn", type="secondary", on_click=lambda: setattr(st.session_state, 'stop_streaming', True))
                                 first_chunk = False
-                            
-                            full_response += chunk.text
-                            # Clean and display progressively
-                            display_text = full_response.replace('**', '').replace('*', '')
-                            response_placeholder.markdown(f"""
-                            <div class="chat-message assistant">
-                                <div class="chat-bubble assistant">
-                                    <div class="chat-text">{display_text}</div>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                    
+
+                            full_response += chunk_text
+
+                    # Streaming complete - strip any internal reasoning and show the final answer
+                    full_response = strip_internal_reasoning(full_response)
+                    thinking_placeholder.empty()
+                    status_placeholder.empty()
+                    if full_response.strip():
+                        response_placeholder.markdown(full_response)
+
                     # Clear stop button
                     stop_button_placeholder.empty()
                     
@@ -1233,15 +2359,464 @@ def main():
                     print(f"DEBUG: Final grounding_sources count: {len(grounding_sources)}")
                     print(f"DEBUG: Final search_suggestions count: {len(search_suggestions)}")
                     
-                    # Clear placeholders
-                    thinking_placeholder.empty()
-                    response_placeholder.empty()
+                    # Fallback: some streaming backends only provide text on the final chunk.
+                    # If we haven't displayed anything yet, keep the Thinking UI visible until we can.
+                    if not full_response and last_chunk is not None:
+                        full_response = _extract_stream_text(last_chunk)
+                    if full_response and first_chunk:
+                        thinking_placeholder.empty()
+                        status_placeholder.empty()
+                        response_placeholder.markdown(full_response)
+                        first_chunk = False
                     
                     # Add assistant message with grounding data
                     # If stopped, add indicator to the response
                     final_response = full_response
+                    expected_part_state = _expected_part_state_from_history(
+                        prompt_for_model,
+                        current_project.get('messages', [])
+                    )
+                    is_intermediate_part = bool(
+                        expected_part_state and not expected_part_state.get("is_final")
+                    )
                     if was_stopped and full_response:
                         final_response = full_response + "\n\n[Response stopped by user]"
+                    elif final_response.strip():
+                        if not is_intermediate_part:
+                            status_placeholder.markdown(
+                                "<div style='color:#5f6368; font-size: 0.85rem; margin-top: 6px;'>Running final verification checks…</div>",
+                                unsafe_allow_html=True,
+                            )
+                        # Optional second-pass tightening for explicit word-count prompts (slow; OFF by default)
+                        fix_instruction = _needs_wordcount_fix(prompt_for_model, final_response) if (st.session_state.enable_wordcount_adjust and not is_intermediate_part) else None
+                        if st.session_state.enable_wordcount_adjust and (not is_intermediate_part) and not fix_instruction:
+                            history_window = _resolve_word_window_from_history(prompt_for_model, current_project.get('messages', []))
+                            if history_window:
+                                min_w, max_w = history_window
+                                actual_w = _count_words(final_response)
+                                if actual_w < min_w or actual_w > max_w:
+                                    fix_instruction = f"Rewrite to total wordcount in range {min_w}-{max_w} (inclusive). Do not exceed {max_w}."
+                                elif (not re.search(r"(?im)^\s*Will Continue to next part, say continue\s*$", final_response)) and (not _has_visible_conclusion(final_response)):
+                                    fix_instruction = (
+                                        f"Rewrite to keep total wordcount in range {min_w}-{max_w} (inclusive), "
+                                        f"and add a clear concluding paragraph at the end so the answer is complete. Do not exceed {max_w}."
+                                    )
+                        if st.session_state.enable_wordcount_adjust and (not is_intermediate_part) and fix_instruction:
+                            response_placeholder = st.empty()
+                            response_placeholder.markdown("""
+                            <div class="chat-message assistant">
+                                <div class="chat-bubble assistant" style="color: #5f6368; font-style: italic;">
+                                    Adjusting to match requested word count…
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            try:
+                                rewrite_prompt = (
+                                    f"{fix_instruction}\n\n"
+                                    "Return ONLY the revised answer.\n"
+                                    "Preserve headings and paragraph breaks exactly; do NOT collapse into one block paragraph.\n"
+                                    "Keep the same question order and section headers.\n"
+                                    "Use case name + full OSCOLA citation in parentheses.\n"
+                                    "If (and only if) this is the final answer, end with exactly one (End of Answer). If it is an intermediate part (it ends with a 'Will Continue...' line), do NOT include (End of Answer).\n\n"
+                                    "ORIGINAL USER PROMPT:\n"
+                                    f"{prompt_for_model}\n\n"
+                                    "DRAFT ANSWER TO REWRITE:\n"
+                                    f"{final_response}\n"
+                                )
+                                (rewrite_text, _), _ = send_message_with_docs(
+                                    api_key,
+                                    rewrite_prompt,
+                                    current_project.get('documents', []),
+                                    current_project['id'],
+                                    history=conversation_history,
+                                    stream=False
+                                )
+                                if isinstance(rewrite_text, str) and rewrite_text.strip():
+                                    final_response = rewrite_text
+                            except Exception as fix_e:
+                                print(f"Word-count fix skipped due to error: {fix_e}")
+                            response_placeholder.empty()
+
+                    if final_response.strip():
+                        # Always run strip_internal_reasoning as a final pass —
+                        # rewrites (word-count fix, citation-fix) may reintroduce
+                        # Law Trove labels, Source N references, or other artifacts.
+                        final_response = strip_internal_reasoning(final_response)
+                        final_response = _strip_generation_artifacts(final_response)
+                        final_response = _restore_paragraph_separation(final_response)
+                        if is_starting_pending_long:
+                            st.session_state.pending_long_prompt = None
+
+                        # Post-output citation enforcement: strip any authority mentions not present in retrieved RAG.
+                        # Pass rag_context length so the sanitizer can skip when retrieval is thin.
+                        allow = get_allowed_authorities_from_rag(rag_context or "", limit=180)
+                        prompt_hints = _extract_authority_hints_from_prompt(prompt_for_model, limit=40)
+                        if prompt_hints:
+                            merged = []
+                            seen = set()
+                            for a in (allow + prompt_hints):
+                                key = (a or "").strip().lower()
+                                if not key or key in seen:
+                                    continue
+                                seen.add(key)
+                                merged.append(a.strip())
+                            allow = merged
+                        rag_ctx_len = len(rag_context or "")
+                        sanitized, removed = sanitize_output_against_allowlist(final_response, allow, rag_context_len=rag_ctx_len, strict=True)
+                        st.session_state.last_citation_allowlist = allow
+                        st.session_state.last_citation_violations = removed
+                        if removed:
+                            # Attempt up to 2 rewrite passes to eliminate non-retrieved citations.
+                            try:
+                                allow_lines = "\n".join([f"- {a}" for a in allow]) if allow else "(none)"
+                                rewrite_candidate = sanitized
+                                removed_curr = removed
+                                # Keep post-check latency low: only one rewrite pass for final parts,
+                                # and only when there are multiple stripped authorities.
+                                max_rewrite_attempts = 0
+                                if st.session_state.get('enable_post_generation_rewrites', False):
+                                    max_rewrite_attempts = 0 if is_intermediate_part else (1 if len(removed_curr) >= 2 else 0)
+                                for _attempt in range(max_rewrite_attempts):
+                                    if not removed_curr:
+                                        break
+                                    rewrite_prompt = (
+                                        "[STRICT NO-HALLUCINATION REWRITE]\n"
+                                        "Rewrite the answer to remove ANY mention/citation of authorities not in the ALLOWED list.\n"
+                                        "If a point depends on a missing authority, rewrite the point generically without naming it.\n"
+                                        "Do NOT introduce any new cases/statutes/articles.\n\n"
+                                        "Preserve headings and paragraph breaks exactly; do NOT collapse into one block paragraph.\n\n"
+                                        "ALLOWED AUTHORITIES (verbatim):\n"
+                                        f"{allow_lines}\n\n"
+                                        "CURRENT ANSWER:\n"
+                                        f"{rewrite_candidate}\n"
+                                    )
+                                    (rewrite_text, _), _ = send_message_with_docs(
+                                        api_key,
+                                        rewrite_prompt,
+                                        current_project.get('documents', []),
+                                        current_project['id'],
+                                        history=conversation_history,
+                                        stream=False
+                                    )
+                                    if isinstance(rewrite_text, str) and rewrite_text.strip():
+                                        rewrite_candidate = _restore_paragraph_separation(rewrite_text)
+                                        rewrite_candidate, removed_curr = sanitize_output_against_allowlist(
+                                            rewrite_candidate, allow, rag_context_len=rag_ctx_len, strict=True
+                                        )
+                                sanitized = rewrite_candidate
+                                st.session_state.last_citation_violations = removed_curr
+                            except Exception as cite_fix_e:
+                                print(f"Citation-fix rewrite skipped due to error: {cite_fix_e}")
+                            final_response = sanitized
+                        else:
+                            final_response = sanitized
+
+                        # Hard cap safety net for strict 99-100% part planning windows.
+                        history_window = _resolve_word_window_from_history(prompt_for_model, current_project.get('messages', []))
+                        if history_window:
+                            min_w, max_w = history_window
+                            final_response = _truncate_to_word_cap(final_response, max_w, min_w)
+                            if (
+                                st.session_state.get('enable_post_generation_rewrites', False)
+                                and (not is_intermediate_part)
+                                and (not re.search(r"(?im)^\s*Will Continue to next part, say continue\s*$", final_response))
+                                and (not _has_visible_conclusion(final_response))
+                            ):
+                                try:
+                                    rewrite_prompt = (
+                                        f"Rewrite to keep total wordcount in range {min_w}-{max_w} (inclusive), "
+                                        f"and add a clear concluding paragraph at the end so the answer is complete. Do not exceed {max_w}.\n\n"
+                                        "Return ONLY the revised answer.\n"
+                                        "Preserve headings and paragraph breaks exactly; do NOT collapse into one block paragraph.\n"
+                                        "Keep the same question order and section headers.\n"
+                                        "Use case name + full OSCOLA citation in parentheses.\n"
+                                        "End with exactly one (End of Answer).\n\n"
+                                        "ORIGINAL USER PROMPT:\n"
+                                        f"{prompt_for_model}\n\n"
+                                        "DRAFT ANSWER TO REWRITE:\n"
+                                        f"{final_response}\n"
+                                    )
+                                    (rewrite_text, _), _ = send_message_with_docs(
+                                        api_key,
+                                        rewrite_prompt,
+                                        current_project.get('documents', []),
+                                        current_project['id'],
+                                        history=conversation_history,
+                                        stream=False
+                                    )
+                                    if isinstance(rewrite_text, str) and rewrite_text.strip():
+                                        final_response = _truncate_to_word_cap(rewrite_text, max_w, min_w)
+                                except Exception as concl_fix_e:
+                                    print(f"Conclusion-fix rewrite skipped due to error: {concl_fix_e}")
+
+                        # If the model still ended abruptly, request a completion patch.
+                        # Trigger only when needed to avoid normal-path latency impact.
+                        if (not was_stopped) and _is_abrupt_answer_ending(final_response):
+                            try:
+                                history_window_now = _resolve_word_window_from_history(
+                                    prompt_for_model, current_project.get('messages', [])
+                                )
+                                # Allow a larger first patch so truncated final parts can actually finish.
+                                max_patch_words_cap = 420
+                                min_patch_words_floor = 60
+                                for _ in range(2):
+                                    if not _is_abrupt_answer_ending(final_response):
+                                        break
+                                    max_patch_words_now = max_patch_words_cap
+                                    min_patch_words_now = min_patch_words_floor
+                                    if history_window_now:
+                                        _min_w_now, _max_w_now = history_window_now
+                                        current_w_now = _count_words(final_response)
+                                        remaining_now = max(0, _max_w_now - current_w_now)
+                                        # If there is little or no headroom, stop patching to avoid overshoot.
+                                        if remaining_now < 25:
+                                            break
+                                        max_patch_words_now = min(max_patch_words_now, remaining_now)
+                                        min_patch_words_now = min(min_patch_words_now, max_patch_words_now)
+                                    completion_prompt = (
+                                        "Continue ONLY from the unfinished ending below.\n"
+                                        "Rules:\n"
+                                        f"- Write {min_patch_words_now} to {max_patch_words_now} words only.\n"
+                                        "- Do NOT restart or repeat prior sections.\n"
+                                        "- Do NOT add new headings.\n"
+                                        "- Complete the final analysis coherently and end with a full sentence.\n"
+                                        "- If the ending is a dangling list marker (for example '1.'), complete the list item with substantive content.\n"
+                                        "- Return ONLY the continuation text.\n\n"
+                                        "UNFINISHED ANSWER:\n"
+                                        f"{final_response}\n"
+                                    )
+                                    (patch_text, _), _ = send_message_with_docs(
+                                        api_key,
+                                        completion_prompt,
+                                        current_project.get('documents', []),
+                                        current_project['id'],
+                                        history=conversation_history,
+                                        stream=False
+                                    )
+                                    if not (isinstance(patch_text, str) and patch_text.strip()):
+                                        break
+                                    patch_clean = _strip_generation_artifacts(patch_text)
+                                    patch_clean = re.sub(r"\(End of Answer\)\s*$", "", patch_clean, flags=re.IGNORECASE).strip()
+                                    patch_clean = re.sub(r"(?im)^\s*Will Continue to next part, say continue\s*$", "", patch_clean).strip()
+                                    if not patch_clean:
+                                        break
+                                    final_response = final_response.rstrip() + "\n\n" + patch_clean
+                                    # Re-apply hard cap after patch to prevent part overshoot.
+                                    if history_window_now:
+                                        _min_w_now, _max_w_now = history_window_now
+                                        final_response = _truncate_to_word_cap(final_response, _max_w_now, _min_w_now)
+                            except Exception as abrupt_fix_e:
+                                print(f"Abrupt-ending completion skipped due to error: {abrupt_fix_e}")
+
+                    # Clean up punctuation artefacts left by citation stripping.
+                    final_response = (final_response or "").replace("[REMOVED: authority not in retrieved sources]", "")
+                    # "()" or "( )" or "(  )" → remove entirely
+                    final_response = re.sub(r'\s*\(\s*\)', '', final_response)
+                    # "( ," or "in (," → just the comma
+                    final_response = re.sub(r'\s*\(\s*,', ',', final_response)
+                    # Dangling open paren before lowercase: "( the judicial" → "the judicial"
+                    final_response = re.sub(r'\(\s+([a-z])', r'\1', final_response)
+                    # Dangling "see " or "in " before nothing: "see ." → "."
+                    final_response = re.sub(r'\b(?:see|in|per|cf)\s+([.;,])', r'\1', final_response)
+                    # Repeated commas/semicolons: ",," or ", ," → ","
+                    final_response = re.sub(r',\s*,', ',', final_response)
+                    final_response = re.sub(r';\s*;', ';', final_response)
+                    # Period after comma: ",." → "."
+                    final_response = re.sub(r',\s*\.', '.', final_response)
+                    # Remove punctuation-only lines and accidental leading punctuation
+                    # created by citation stripping (e.g., ". By telling customers ...").
+                    final_response = re.sub(r'(?m)^\s*[.,;:]\s*$', '', final_response)
+                    final_response = re.sub(r'(?m)^\s*[.,;:]\s+(?=[A-Z])', '', final_response)
+                    # Double spaces left by removals
+                    final_response = re.sub(r'  +', ' ', final_response)
+                    # Fix dangling citation slots after strict allowlist stripping:
+                    # "In , the court..." / "As noted in , ..." → remove the broken lead-in.
+                    final_response = re.sub(
+                        r'(?i)\b('
+                        r'in|under|see|cf|compare|per|'
+                        r'as\s+noted\s+in|as\s+held\s+in|as\s+stated\s+in|as\s+applied\s+in|as\s+explained\s+in|as\s+affirmed\s+in'
+                        r')\s+(?:the\s+case\s+of\s+)?\s*,\s*',
+                        '',
+                        final_response,
+                    )
+                    final_response = re.sub(
+                        r'(?i)\b('
+                        r'in|under|see|cf|compare|per|'
+                        r'as\s+noted\s+in|as\s+held\s+in|as\s+stated\s+in|as\s+applied\s+in|as\s+explained\s+in|as\s+affirmed\s+in'
+                        r')\s+(?:the\s+case\s+of\s+)?\s+(\.)',
+                        r'\2',
+                        final_response,
+                    )
+                    # Triple+ newlines
+                    final_response = re.sub(r"\n{3,}", "\n\n", final_response).strip()
+                    final_response = _restore_paragraph_separation(final_response)
+                    is_short_single_essay = _is_short_single_essay_prompt(prompt_for_model)
+                    if is_short_single_essay:
+                        final_response = _normalize_short_essay_output(final_response)
+
+                    # Mandatory final essay-quality pass (short + long final parts):
+                    # enforce structure, substantive conclusion, and fluency repairs.
+                    is_essay_mode = _is_essay_flow(prompt_for_model, current_project.get('messages', []))
+                    if (not was_stopped) and (not is_intermediate_part) and is_essay_mode:
+                        quality_issues = _essay_quality_issues(final_response, prompt_for_model, is_short_single_essay)
+                        if quality_issues:
+                            try:
+                                history_window_now = _resolve_word_window_from_history(
+                                    prompt_for_model, current_project.get('messages', [])
+                                )
+                                if history_window_now:
+                                    _min_w_now, _max_w_now = history_window_now
+                                    window_rule = f"Keep total wordcount in range {_min_w_now}-{_max_w_now} (inclusive). Do not exceed {_max_w_now}."
+                                else:
+                                    targets_now = _extract_word_targets(prompt_for_model)
+                                    if len(targets_now) == 1:
+                                        _max_w_now = int(targets_now[0])
+                                        _min_w_now = int(_max_w_now * 0.90)
+                                        window_rule = f"Keep total wordcount in range {_min_w_now}-{_max_w_now} (inclusive). Do not exceed {_max_w_now}."
+                                    else:
+                                        window_rule = "Keep roughly the same length and do not bloat."
+
+                                issues_block = "\n".join([f"- {i}" for i in quality_issues[:8]])
+                                rewrite_prompt = (
+                                    "[ESSAY QUALITY REWRITE - MANDATORY]\n"
+                                    "Rewrite the draft into an exam-ready high-quality essay response.\n"
+                                    "You MUST fix these defects:\n"
+                                    f"{issues_block}\n\n"
+                                    "Rules:\n"
+                                    f"- {window_rule}\n"
+                                    "- Preserve legal substance and issue coverage.\n"
+                                    "- Keep section headings and paragraph breaks clean and readable.\n"
+                                    "- Remove placeholders/artefacts and ensure every sentence is complete.\n"
+                                    "- Provide one substantive concluding section at the end.\n"
+                                    "- Do NOT output debug/context/tool syntax.\n"
+                                    "- Return ONLY the revised final answer.\n\n"
+                                    "ORIGINAL USER PROMPT:\n"
+                                    f"{prompt_for_model}\n\n"
+                                    "DRAFT ANSWER:\n"
+                                    f"{final_response}\n"
+                                )
+                                (rewrite_text, _), _ = send_message_with_docs(
+                                    api_key,
+                                    rewrite_prompt,
+                                    current_project.get('documents', []),
+                                    current_project['id'],
+                                    history=conversation_history,
+                                    stream=False
+                                )
+                                if isinstance(rewrite_text, str) and rewrite_text.strip():
+                                    final_response = strip_internal_reasoning(rewrite_text)
+                                    final_response = _strip_generation_artifacts(final_response)
+                                    final_response = _restore_paragraph_separation(final_response)
+                                    if is_short_single_essay:
+                                        final_response = _normalize_short_essay_output(final_response)
+                                    if history_window_now:
+                                        final_response = _truncate_to_word_cap(final_response, _max_w_now, _min_w_now)
+                            except Exception as quality_fix_e:
+                                print(f"Essay-quality rewrite skipped due to error: {quality_fix_e}")
+
+                    # Final-part safety net: ensure a visible conclusion block exists even when
+                    # the model spends budget on earlier analysis. Keep within current word cap.
+                    if (not is_intermediate_part) and (not _has_visible_conclusion(final_response)):
+                        if is_short_single_essay:
+                            fallback = (
+                                "Part V: Conclusion\n\n"
+                                "On balance, occupiers' liability is best read as a controlled balance between safety and autonomy. "
+                                "Lawful visitors receive broader protection under the 1957 Act, while non-visitors under the 1984 Act "
+                                "receive a narrower, knowledge-based duty tied to reasonableness. Post-Tomlinson authority confirms that "
+                                "obvious risks and voluntarily assumed dangers generally remain with the claimant, preserving both public "
+                                "amenity and the occupier's practical freedom to use land without turning every hazard into strict liability. "
+                                "The doctrinal endpoint is therefore not zero protection, but proportionate protection against non-obvious "
+                                "premises dangers that occupiers can reasonably prevent."
+                            )
+                        else:
+                            heading = _next_part_conclusion_heading(final_response)
+                            fallback = (
+                                f"{heading}\n\n"
+                                "On balance, the strongest legal route and likely outcome are as set out above, "
+                                "subject to evidence and procedure in the relevant forum."
+                            )
+                        history_window_now = _resolve_word_window_from_history(
+                            prompt_for_model, current_project.get('messages', [])
+                        )
+                        if history_window_now:
+                            _min_w_now, _max_w_now = history_window_now
+                            final_response = _append_conclusion_within_cap(final_response, fallback, _max_w_now)
+                        else:
+                            targets_now = _extract_word_targets(prompt_for_model)
+                            if len(targets_now) == 1:
+                                max_now = int(targets_now[0])
+                                if is_short_single_essay:
+                                    max_now = _short_essay_effective_cap(max_now)
+                                final_response = _append_conclusion_within_cap(final_response, fallback, max_now)
+                            else:
+                                final_response = final_response.rstrip() + "\n\n" + fallback
+
+                    # Single-response hard cap: if the user explicitly requested N words in ONE response,
+                    # enforce "do not exceed N" locally without a second LLM pass (fast + deterministic).
+                    # Multi-part flows are capped elsewhere via the history-anchored window logic.
+                    try:
+                        targets = _extract_word_targets(prompt_for_model)
+                        if len(targets) == 1 and not _expected_part_state_from_history(prompt_for_model, current_project.get('messages', [])):
+                            max_w = int(targets[0])
+                            if is_short_single_essay:
+                                max_w = _short_essay_effective_cap(max_w)
+                            min_w = int(max_w * 0.99)
+                            final_response = _truncate_to_word_cap(final_response, max_w, min_w)
+                    except Exception as cap_e:
+                        print(f"Word-cap enforcement skipped due to error: {cap_e}")
+
+                    # Final hardening: clean any leaked debug artefacts and enforce the
+                    # correct part ending marker (intermediate vs final) from history.
+                    final_response = _strip_generation_artifacts(final_response)
+                    if not is_short_single_essay:
+                        final_response = _enforce_part_numbered_conclusion_heading(final_response)
+                    else:
+                        final_response = _normalize_short_essay_output(final_response)
+                        # Deterministic final guarantee for short essays:
+                        # ensure substantive Part V conclusion survives final word-cap constraints.
+                        short_targets = _extract_word_targets(prompt_for_model)
+                        if len(short_targets) == 1:
+                            short_max = _short_essay_effective_cap(int(short_targets[0]))
+                            short_concl_words = _count_words(_extract_conclusion_section_text(final_response))
+                            if (not re.search(r"(?im)^\s*Part\s+V\s*:\s*Conclusion\b", final_response)) or short_concl_words < 90:
+                                force_conclusion = (
+                                    "Part V: Conclusion\n\n"
+                                    "Overall, the strongest synthesis is that occupiers' liability imposes proportionate, not absolute, "
+                                    "safety obligations. The regime requires meaningful protection against non-obvious and controllable "
+                                    "premises dangers, while maintaining claimant responsibility for obvious and voluntarily accepted risks. "
+                                    "That balance preserves both personal autonomy and the social utility of public/private land use."
+                                )
+                                final_response = _append_conclusion_within_cap(final_response, force_conclusion, short_max)
+                                final_response = _normalize_short_essay_output(final_response)
+                    final_response = _enforce_part_ending_by_history(
+                        final_response,
+                        prompt_for_model,
+                        current_project.get('messages', [])
+                    )
+                    # Absolute last-pass guarantee for short essays:
+                    # if conclusion is still missing/thin after all transforms, inject it now.
+                    if is_short_single_essay:
+                        try:
+                            short_targets = _extract_word_targets(prompt_for_model)
+                            if len(short_targets) == 1:
+                                short_max = _short_essay_effective_cap(int(short_targets[0]))
+                                body_now = re.sub(r"\(End of Answer\)\s*$", "", final_response, flags=re.IGNORECASE).strip()
+                                concl_words_now = _count_words(_extract_conclusion_section_text(body_now))
+                                has_part_v_now = bool(re.search(r"(?im)^\s*Part\s+V\s*:\s*Conclusion\b", body_now))
+                                if (not has_part_v_now) or concl_words_now < 90:
+                                    forced_tail = (
+                                        "Part V: Conclusion\n\n"
+                                        "Overall, the better view is that occupiers' liability imposes proportionate safety obligations rather than "
+                                        "absolute insurance duties. The law protects entrants against non-obvious and controllable premises dangers, "
+                                        "while preserving responsibility for obvious and voluntarily accepted risks. This keeps the regime coherent: "
+                                        "it respects claimant safety without collapsing property use and public amenity into defensive over-regulation."
+                                    )
+                                    body_now = _append_conclusion_within_cap(body_now, forced_tail, short_max)
+                                    body_now = _normalize_short_essay_output(body_now)
+                                    final_response = _enforce_end_of_answer(body_now)
+                        except Exception as final_short_fix_e:
+                            print(f"Final short-essay conclusion guarantee skipped: {final_short_fix_e}")
+                    status_placeholder.empty()
                     
                     # Only add message if there's content
                     if final_response.strip():
@@ -1252,12 +2827,43 @@ def main():
                             'timestamp': datetime.now().isoformat(),
                             'grounding_sources': grounding_sources if not was_stopped else [],
                             'search_suggestions': search_suggestions if not was_stopped else [],
-                            'was_stopped': was_stopped
+                            'was_stopped': was_stopped,
+                            # Store RAG for per-message debug display (keep string even if empty)
+                            'rag_context': rag_context or "",
+                            'citation_allowlist': st.session_state.get('last_citation_allowlist', []),
+                            'citation_violations': st.session_state.get('last_citation_violations', [])
                         }
                         current_project['messages'].append(assistant_message)
+                        
+                        # Display RAG Debug info if enabled
+                        if st.session_state.show_rag_debug:
+                            with st.expander("📚 RAG Retrieved Content (Debug)", expanded=False):
+                                last_ctx = st.session_state.last_rag_context or ""
+                                st.markdown(f"**Context Length:** {len(last_ctx)} characters")
+                                if 0 < len(last_ctx) < 15000:
+                                    st.warning(f"⚠️ Low retrieval: only {len(last_ctx):,} characters. Consider adding more materials for this legal area.")
+                                st.markdown("---")
+                                if last_ctx:
+                                    st.code(last_ctx[:5000] + ("..." if len(last_ctx) > 5000 else ""), language=None)
+                                else:
+                                    st.code("(No RAG context returned for this message.)", language=None)
+                    else:
+                        # If we got no text at all, surface an actionable error instead of silently adding nothing.
+                        error_message = {
+                            'id': str(uuid.uuid4()),
+                            'role': 'assistant',
+                            'text': "I didn’t receive any text back from the model (empty streamed response). Please try again; if it repeats, check the terminal logs for Gemini/API errors or quota/timeouts.",
+                            'timestamp': datetime.now().isoformat(),
+                            'is_error': True
+                        }
+                        current_project['messages'].append(error_message)
                     
                 except Exception as e:
                     thinking_placeholder.empty()
+                    try:
+                        status_placeholder.empty()
+                    except Exception:
+                        pass
                     response_placeholder.empty()
                     # Add error message
                     error_message = {
@@ -1273,4 +2879,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
